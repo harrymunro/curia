@@ -1,0 +1,11 @@
+# Vault folders that vault-search may read for this repo and its worktrees (the
+# tool finds this file by walking up from the working directory). The vault
+# holds other projects' and clients' notes: nothing outside Business/Curia/.
+# --folder can narrow inside these folders but never widen past them.
+folders = ["Business/Curia"]
+
+# Whether excerpts of these notes go to Jev (TypeSafe's model, through
+# OpenRouter's zero-retention route) for ranking. On by the owner's decision of
+# 2026-10-10 for every Workspace project. false means local keyword ranking
+# only. The owner's decision, not an agent's.
+typesafe = true

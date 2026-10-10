@@ -248,3 +248,31 @@ weaken it to get green.
 account's `$CLAUDE_CONFIG_DIR/skills/*` and `~/.local/bin/curia` (symlinks into
 here), each estate's own directory, and any launchd units an estate installs.
 Changing a path here can break those; check before you move something.
+
+## Session notes (Obsidian vault)
+
+Persistent prose (session notes, decisions, research) lives in the owner's vault
+at `~/Documents/Obsidian Vault`, project folder `Business/Curia/`, index `Curia MOC.md`. The
+repo keeps code and its docs; the vault keeps what should outlive a session.
+
+- **Confidentiality**: the vault holds notes for other clients and private
+  notes. Never read, list, search or write outside `Business/Curia/`. Scope
+  every `obsidian` CLI call with `path=` or `folder=`; vault-wide commands
+  (`search` without `path=`, `files` without `folder=`, `properties`,
+  `orphans`, `deadends`, `recents`, `random`, `bases`, `daily:*`) are
+  forbidden here.
+- **Start**: read `Curia Session Log.md` for continuity; open a note under
+  `Sessions/` only when you need the detail. If the folder or log does not
+  exist yet, create `Curia MOC.md` and `Curia Session Log.md` (a table of date,
+  note and summary, newest row first).
+- **Finding past context**: use the `vault-search` skill (`vault-search
+  "<question>"`) before reading or grepping notes by hand. It is scoped to
+  this folder by `.claude/vault-search.toml` and ranks passages with Jev
+  (the owner's decision; never edit that file).
+- **End**: write `Sessions/YYYY-MM-DD<letter>-topic.md` and add a one-line row
+  at the top of the table in `Curia Session Log.md`. Frontmatter: `project:
+  Curia`, `source: claude`, `date: YYYY-MM-DD`, `type:
+  session|meeting|decision|research|note`, `summary: <one line>`. Link new
+  evergreen notes from `Curia MOC.md`.
+- The `obsidian` CLI needs the app running; if it errors, read and write the
+  files directly under the same folder.
