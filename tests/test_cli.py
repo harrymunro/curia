@@ -1736,6 +1736,62 @@ def test_everything_without_by_gives_the_orders_it_always_gave(curia, cli, estat
     assert "by=" not in line
 
 
+def test_a_deferred_bead_is_read_the_way_bd_ready_reads_it(curia, estate, monkeypatch):
+    ahead, past = "2026-06-02T00:00:00Z", "2026-06-01T00:00:00Z"
+
+    def d(i, status="deferred", until=None, **kw):
+        return {**by_bead(i, status=status, **kw), "defer_until": until}
+
+    rows = [d("ice"),                                # no date: set aside until someone undefers it
+            d("snoozed", until=ahead),
+            d("due", until=past),                    # past its date: bd reopens it at its next ready read
+            d("open-snoozed", "open", until=ahead),
+            d("open-due", "open", until=past),
+            d("garbled", until="whenever"),          # a date that cannot be read leaves the status to say
+            d("working", "in_progress", until=ahead),   # someone is on it
+            d("shut", "closed", until=ahead),
+            by_bead("on-ice", blocks=("ice",)),      # nothing can bring it through tonight
+            by_bead("on-due", blocks=("due",)),      # its blocker is back, so it comes through
+            by_bead("plain")]
+    ids = lambda xs: sorted(i["id"] for i in xs)   # noqa: E731
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 1, 12, 0, tzinfo=UTC))
+    b = curia.sort_board(estate, rows)
+    assert ids(b["ready"]) == ["due", "open-due", "plain"] and ids(b["working"]) == ["working"]
+    assert ids(b["blocked"]) == ["on-due"] and b["closed"] == 1
+    assert ids(b["human"]) == ["garbled", "ice", "on-ice", "open-snoozed", "snoozed"]
+    # the clock is read when asked: a snooze wakes on the first reading after its date, the icebox never does
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 3, 12, 0, tzinfo=UTC))
+    b = curia.sort_board(estate, rows)
+    assert ids(b["ready"]) == ["due", "open-due", "open-snoozed", "plain", "snoozed"]
+    assert ids(b["human"]) == ["garbled", "ice", "on-ice"]
+    # a board rebuilt for a past moment reads the dates against that moment, not now
+    stamped = [{**r, "created_at": "2026-01-01T00:00:00Z"} for r in rows]
+    then = curia.board_at(estate, stamped, dt.datetime(2026, 6, 1, 12, 0, tzinfo=UTC))
+    assert "snoozed" in ids(then["human"]) and "snoozed" not in ids(then["ready"])
+
+
+def test_everything_leaves_deferred_beads_and_ends_with_only_them_left(curia, cli, estate, monkeypatch):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    rows = {"al-1": by_bead("al-1"), "al-2": by_bead("al-2", status="deferred"),
+            "al-3": by_bead("al-3", blocks=("al-2",))}
+    write_board(export, rows.values())
+    orders = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        orders.append(cmd[-1])
+        rows["al-1"]["status"] = "closed"
+        write_board(export, rows.values())
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything")
+    assert rc == 0, err
+    assert len(orders) == 1   # the board is clear with the deferred bead and what it blocks still there
+    assert "1 ready (al-1)" in orders[0] and "2 waiting on a human (al-2, al-3;" in orders[0]
+    assert "board in alpha is clear" in out and "(2 waiting, 1 closed)" in out
+
+
 def test_progress_reads_a_by_night_the_way_it_ran(curia, cli, estate, monkeypatch, tmp_path):
     def stamped(bead, created, closed=None):
         return {**bead, "created_at": created, "closed_at": closed}

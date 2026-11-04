@@ -1590,13 +1590,24 @@ def filed_by(i: dict, by: list[str]) -> bool:
     return bool(who & {str(i.get(k) or "").casefold() for k in ("created_by", "owner")})
 
 
+def is_deferred(i: dict, at: dt.datetime | None = None) -> bool:
+    """Set aside, as `bd ready` reads it: deferred with no date (until someone
+    undefers it), or a date still ahead. A date that has passed makes the bead
+    open again, though the export says so only after bd next reads its ready
+    front. A bead someone is working has not been set aside."""
+    if i.get("status") in ("closed", "in_progress"):
+        return False
+    until = parse_iso(str(i.get("defer_until") or ""))
+    return until > (at or now()) if until else i.get("status") == "deferred"
+
+
 def board(est: Estate, repo: str, by: list[str] | None = None) -> dict:
     """The repo's beads export sorted for a night's work. ready: open and
     nothing open blocks it. working: in progress. blocked: by open beads on
     the board, which will come through. human: waiting on a person - a label
     from `human_labels`, a blocked bead with nothing open on the board
-    blocking it, or a bead blocked only by such beads or by ids not on the
-    board. closed: how many are. source: where the export was read from (see
+    blocking it, a deferred bead (see is_deferred), or a bead blocked only by
+    such beads or by ids not on the board. closed: how many are. source: where the export was read from (see
     board_export). issues: the export's beads as read, all of them. by: only
     the beads those people filed are sorted (see sort_board). Only as fresh as
     the last export."""
@@ -1607,12 +1618,14 @@ def board(est: Estate, repo: str, by: list[str] | None = None) -> dict:
     return out
 
 
-def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None) -> dict:
+def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None,
+               at: dt.datetime | None = None) -> dict:
     """The beads of an export sorted for a night's work: ready, working,
     blocked, human and closed, as `board` says. With `by`, only the beads
     those people filed are sorted, against the whole board: a blocker someone
     else closed is no blocker, and one still open is off this night's board,
-    so what it blocks waits on a person. others: the open beads left out."""
+    so what it blocks waits on a person. others: the open beads left out. at:
+    the time deferral dates are read against, by default now."""
     mine = [i for i in issues if not by or filed_by(i, by)]
     scope = {i["id"] for i in mine}
     status = {i["id"]: i.get("status") for i in issues}
@@ -1623,7 +1636,8 @@ def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None) -> 
     # blocked with no blocker on record is blocked by something off the board: a person.
     # Blocked with every blocker closed is merely not flipped back yet; it is ready.
     human = {i["id"] for i in mine if i.get("status") != "closed"
-             and (set(i.get("labels") or []) & labels or (i.get("status") == "blocked" and not recorded[i["id"]]))}
+             and (set(i.get("labels") or []) & labels or (i.get("status") == "blocked" and not recorded[i["id"]])
+                  or is_deferred(i, at))}
     grew = True
     while grew:   # blocked only by what waits on a person waits on a person
         grew = False
@@ -1676,9 +1690,9 @@ def counts_from_detail(detail: str) -> dict[str, int]:
 def board_at(est: Estate, issues: list[dict], t: dt.datetime) -> dict | None:
     """The board as the export's own timestamps say it stood at t: beads
     created by then, closed only if closed by then (else in progress if
-    started by then, else open). Labels and dependencies are as they are now,
-    so this is a reconstruction, not a reading; None when the export carries
-    no timestamps to rebuild from."""
+    started by then, else open). Labels, dependencies and an undated deferral
+    are as they are now, so this is a reconstruction, not a reading; None when
+    the export carries no timestamps to rebuild from."""
     if not any(i.get("created_at") for i in issues):
         return None
     then = []
@@ -1695,7 +1709,7 @@ def board_at(est: Estate, issues: list[dict], t: dt.datetime) -> dict | None:
         elif i.get("status") == "in_progress" and started and started > t:
             i["status"] = "open"
         then.append(i)
-    return sort_board(est, then)
+    return sort_board(est, then, at=t)
 
 
 def night_orders(until: dt.datetime | None = None, budget: float | None = None,
@@ -6753,8 +6767,11 @@ the slice.
 gets orders naming what is ready, in progress, blocked by other beads on
 the board, and waiting on a human - a label from estate.toml
 `human_labels`, a blocked bead with nothing open on the board blocking
-it, or a bead blocked only by such beads or by ids not on the board; those
-are left alone. --loop is implied. After each handoff the board is read
+it, a deferred bead, or a bead blocked only by such beads or by ids not on
+the board; those are left alone. Deferred is read the way `bd ready` reads
+it: no date, or a date still ahead. Once the date has passed the bead is
+ready again, even while the export still says deferred. --loop is implied.
+After each handoff the board is read
 again from the repo's beads export as pushed to origin's integration
 branch - the checkout the estate names may be one nobody pulls - or from
 the file on disk where the repo has no origin (so the orders tell the seat
