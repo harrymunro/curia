@@ -116,7 +116,7 @@ ln -s "$PWD/skills/handoff" ~/.claude/skills/handoff     # user-level skill
 ## Daily use
 
 ```sh
-curia help                       # the vocabulary and the rhythm; `curia help <command>` for one in full
+curia help                       # the vocabulary, every command and worked examples; `curia help <command>` for one in full
 curia roster                     # who is on the estate
 curia check                      # is the estate consistent
 curia status                     # who is awake, whose memory is how old, what the offices last said

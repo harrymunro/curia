@@ -6268,6 +6268,41 @@ The record
 Estates
   init <path> --name N --principal P --shape S   a new estate; S is seat, crew or factory (`help init` for each)
 
+Examples (the <placeholders> are yours; `curia help <command>` has more)
+  Start the day: who is awake, and how the last long run went
+    curia status
+    curia progress <seat>
+
+  Wake a seat, in the repo you are in or in one you name
+    curia launch <seat>
+    curia launch <seat> --repo <repo> --say "..."
+
+  Work a board until nothing remains but what waits on a person
+    curia launch <office> --repo <repo> --everything
+
+  ...only the beads one person filed, under each name they file as
+    curia launch <office> --repo <repo> --everything --by "<name>" --by <email>
+
+  ...the same, but see what it comes to and who it leaves out, without launching
+    curia launch <office> --repo <repo> --everything --by "<name>" --by <email> --print-cmd
+
+  ...ending by 06:30 local time, or at $200 of recorded spend
+    curia launch <office> --repo <repo> --everything --until 06:30 --budget 200
+
+  ...across several boards, in that order
+    curia launch <office> --everything --repo <repo> --repo <repo2>
+
+  Give a fleet worker a bead in a worktree of its own, with a seat to review it
+    curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>
+
+  Turn meeting notes into beads, from files or the clipboard
+    curia ingest <notes...>
+    curia ingest --paste
+
+  See what the land gate and the cleanup would do, without doing it
+    curia portcullis --dry-run
+    curia reap --dry-run
+
 The estate is found from --estate, CURIA_ESTATE, a walk up from the working
 directory, then the registry (~/.config/curia/estates.toml): the estate whose
 roster has the seat you named, or the only one registered. Inside a workspace
@@ -7329,8 +7364,9 @@ declares more than fences_max. A fence is distrust written down, and the
 log is the one fact that says which of them earn their keep.""",
 
     "help": """\
-With no argument, the overview: vocabulary, the daily rhythm, every
-command. With a command, that command's page in full.""",
+With no argument, the overview: the vocabulary, every command, and example
+invocations of the common ones. With a command, that command's page in
+full, its own examples included.""",
 }
 
 HELP_EXAMPLES = {
@@ -7829,7 +7865,7 @@ def main() -> None:
                         "the Censor, a cloud Lictor, the Portcullis)")
     p.set_defaults(fn=cmd_init)
 
-    p = parser("help", "the vocabulary and the rhythm; `help <command>` for one in full")
+    p = parser("help", "the vocabulary, every command and worked examples; `help <command>` for one in full")
     p.add_argument("command", nargs="?", help="a command to explain in full")
     p.set_defaults(fn=cmd_help, subparsers=sub)
 

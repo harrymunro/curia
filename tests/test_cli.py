@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -691,6 +692,25 @@ def test_help_covers_every_command(curia, cli):
         assert rc == 0 and curia.HELP_DETAIL[name].splitlines()[0][:30] in out
     rc, out, _ = cli("help")
     assert rc == 0 and out.strip() == curia.HELP_OVERVIEW.strip()
+
+
+def test_the_overviews_examples_are_invocations_the_parser_takes(curia, cli, monkeypatch):
+    section = curia.HELP_OVERVIEW.split("\nExamples", 1)[1].split("\nThe estate is found", 1)[0]
+    examples = [line.strip() for line in section.splitlines() if line.strip().startswith("curia ")]
+    assert len(examples) >= 10
+    assert any("--everything" in e and "--by" in e and "--print-cmd" in e for e in examples)
+    called = []
+    for name in dir(curia):
+        if name.startswith("cmd_"):   # parsed, then stopped: nothing here should run
+            monkeypatch.setattr(curia, name, lambda a, n=name: called.append(n))
+    for example in examples:
+        called.clear()
+        rc, _, err = cli(*shlex.split(example)[1:])
+        assert rc == 0 and len(called) == 1, f"{example}: {err}"
+    # `curia help` is where they are read
+    monkeypatch.undo()
+    rc, out, _ = cli("help")
+    assert rc == 0 and all(e in out for e in examples)
 
 
 def test_prime_reads_the_last_three_journal_entries(curia, estate):
