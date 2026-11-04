@@ -1611,7 +1611,7 @@ def run_detached(sd: Path, title: str, label: str, body, wait: bool) -> None:
         sys.exit(rc)
 
 
-def board_export(est: Estate, repo: str) -> tuple[str, str, bool]:
+def read_export(est: Estate, repo: str) -> tuple[str, str, bool] | None:
     """The export a board is read from, where it came from, and whether that
     reading is fresh (False when the fetch behind it failed, so it is the
     last one again and says nothing about the night since). When the repo
@@ -1620,7 +1620,8 @@ def board_export(est: Estate, repo: str) -> tuple[str, str, bool]:
     estate names may be one nobody pulls (a launcher read a stale one on two
     wakings running while the office merged, exported and pushed from a
     worktree of its own, saw the same board twice, and stopped for the
-    night). With no origin, or no export on that branch, the file on disk."""
+    night). With no origin, or no export on that branch, the file on disk;
+    None when there is no such file either."""
     src = est.repo_path(repo)
     r = est.repos.get(repo, {})
     b = r.get("integration_branch")
@@ -1634,9 +1635,30 @@ def board_export(est: Estate, repo: str) -> tuple[str, str, bool]:
                 return (p.stdout, f"{ref} at {sha}, " + ("as pushed" if fetched else
                         "as last fetched (this fetch FAILED)"), fetched)
     local = src / ".beads" / "issues.jsonl"
-    if not local.exists():
+    return (local.read_text(), "the export on disk", True) if local.exists() else None
+
+
+def board_export(est: Estate, repo: str) -> tuple[str, str, bool]:
+    """read_export, for a caller with nothing to do without one."""
+    got = read_export(est, repo)
+    if got is None:
         die(f"{repo} has no .beads/issues.jsonl export; there is no board to work")
-    return local.read_text(), "the export on disk", True
+    return got
+
+
+def board_ids(est: Estate, repo: str) -> list[str] | None:
+    """The ids on a repo's board, read as the launcher reads them; None where
+    they cannot be read (no checkout, no export, an export that does not
+    parse), so that the gate takes nothing rather than guess."""
+    if not est.repo_path(repo).is_dir():
+        return None
+    got = read_export(est, repo)
+    if got is None:
+        return None
+    try:
+        return [json.loads(line)["id"] for line in got[0].splitlines() if line.strip()]
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def filed_by(i: dict, by: list[str]) -> bool:
@@ -5126,12 +5148,19 @@ def bd_close(repo: Path, bead: str) -> str:
     return f"{bead} closed" if p.returncode == 0 else f"bd close {bead} failed: {(p.stderr or p.stdout).strip()}"
 
 
-def bead_named(text: str, prefixes: list[str]) -> str | None:
-    """The first bead id of the repo's prefixes in the text, or None."""
+def bead_named(text: str, prefixes: list[str], board: list[str]) -> str | None:
+    """The first bead on the board that the text names, or None. An id is a
+    prefix and a hash or a number, and a child carries its place: x-y2o94,
+    x-966, x-qddw.15. A word can look like one (a branch x-fix-login), and the
+    gate merges what this picks, so only an id on the board counts."""
     if not prefixes:
         return None
-    m = re.search(r"\b((?:" + "|".join(re.escape(p) for p in prefixes) + r")-\d+)\b", text, re.I)
-    return m.group(1) if m else None
+    known = {i.lower(): i for i in board}
+    pattern = r"\b(?:" + "|".join(re.escape(p) for p in prefixes) + r")-[a-z0-9]+(?:\.[0-9]+)*\b"
+    for m in re.finditer(pattern, text, re.I):
+        if m.group(0).lower() in known:
+            return known[m.group(0).lower()]
+    return None
 
 
 def pr_gate(pr: dict, label: str) -> tuple[bool, str]:
@@ -5170,7 +5199,7 @@ def cmd_portcullis(a) -> None:
     label = a.label or est.land_label
     summary = [f"# Portcullis report, {est.name} estate, {now():%Y-%m-%d %H:%M}Z" + (" (dry run)" if a.dry_run else ""),
                "",
-               "A PR is a seat's when its branch or title names a bead of the repo. It lands when it is not a "
+               "A PR is a seat's when its branch or title names a bead on the repo's board. It lands when it is not a "
                f"draft, is reviewed (an APPROVED review or the `{label}` label), every check is green and it is "
                "mergeable; landing closes the bead. Everything else stays where it is, with the reason.", ""]
     landed, held, failed = 0, 0, 0
@@ -5185,7 +5214,11 @@ def cmd_portcullis(a) -> None:
         if prs is None:
             summary.append(f"- gh unavailable or unauthorised ({GH_ERROR or 'no reason given'}); nothing landed\n")
             continue
-        mine = [(pr, bead_named(f"{pr.get('headRefName', '')} {pr.get('title', '')}", r.get("beads_prefix", [])))
+        known = board_ids(est, k) if prs else []
+        if known is None:
+            summary.append(f"- no beads export to check {len(prs)} open PR(s) against; nothing taken\n")
+            continue
+        mine = [(pr, bead_named(f"{pr.get('headRefName', '')} {pr.get('title', '')}", r.get("beads_prefix", []), known))
                 for pr in prs]
         mine = [(pr, bead) for pr, bead in mine if bead]
         if not mine:
@@ -6527,7 +6560,11 @@ and offices are launched or run.""",
     "portcullis": """\
 The land gate. For each github repo with an integration branch, list the
 open PRs against it and take the seats' - those whose branch or title
-names a bead of the repo (its beads_prefix). A PR lands when it is not a
+names a bead on the repo's board: an id with one of its beads_prefix that
+is in the export, read as the launcher reads it. A branch that only looks
+like an id is left alone, and a repo with no export has nothing taken. A
+person's PR that names a bead is taken like a seat's, and still has to be
+reviewed and green. A PR lands when it is not a
 draft, is reviewed (an APPROVED review, or the land label from estate.toml
 `land_label`, default 'reviewed', which a reviewer with the same forge
 identity as the worker can add where it cannot approve), every check is

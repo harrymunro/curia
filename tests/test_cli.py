@@ -1193,6 +1193,7 @@ def test_portcullis_lands_reviewed_green_prs_and_closes_their_beads(curia, cli, 
 
     monkeypatch.setattr(curia, "gh_run", fake_gh)
     monkeypatch.setattr(curia, "bd_close", lambda repo, bead: closed.append((repo, bead)) or f"{bead} closed")
+    write_board(estate.root / "alpha" / ".beads" / "issues.jsonl", [by_bead(f"al-{n}") for n in range(1, 10)])
     rc, out, _ = cli(*E(estate), "portcullis", "--dry-run")
     assert rc == 0 and not merged and "-> would land" in out and "(dry run)" in out
     assert not (estate.dir / "brain" / "portcullis").exists()
@@ -1220,6 +1221,60 @@ def test_portcullis_lands_reviewed_green_prs_and_closes_their_beads(curia, cli, 
     monkeypatch.setattr(curia, "gh_json", lambda args: [] if args[:2] == ["pr", "list"] else None)
     rc, out, _ = cli(*E(estate), "portcullis")
     assert rc == 0 and "names a bead" in out and "written" not in out and not told.exists()
+
+
+BOARD = ["al-y2o94", "al-966", "al-qddw", "al-qddw.15", "su-c3y"]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("worker/al-y2o94 a fix", "al-y2o94"),                    # a hash
+    ("al-966: a number", "al-966"),
+    ("worker/al-qddw.15", "al-qddw.15"),                      # a child, not its parent
+    ("AL-Y2O94: in capitals", "al-y2o94"),                    # the board's own spelling comes back
+    ("worker/al-y2o94-second-try", "al-y2o94"),
+    ("su-c3y", "su-c3y"),                                     # any of the repo's prefixes
+    ("feature/al-login-fix names al-y2o94", "al-y2o94"),      # the first that is on the board
+    ("al-nosuch: not on the board", None),
+    ("feature/al-login-fix", None),                           # only looks like an id
+    ("al-qddw.99: a child that is not there", None),          # never falls back to the parent
+    ("xal-y2o94", None),
+    ("zz-y2o94", None),                                       # another repo's prefix
+])
+def test_bead_named_finds_ids_on_the_board_and_nothing_else(curia, text, want):
+    assert curia.bead_named(text, ["al", "su"], BOARD) == want
+
+
+def test_bead_named_with_no_prefix_names_nothing(curia):
+    assert curia.bead_named("al-y2o94", [], BOARD) is None
+
+
+def test_portcullis_takes_real_ids_and_leaves_what_only_looks_like_one(curia, cli, estate, monkeypatch):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    write_board(export, [by_bead("al-y2o94"), by_bead("al-qddw.15")])
+
+    def pr(n, title, head):
+        return {"number": n, "title": title, "headRefName": head, "isDraft": False, "reviewDecision": "APPROVED",
+                "statusCheckRollup": [{"name": "ci", "conclusion": "SUCCESS", "status": "COMPLETED"}], "labels": [],
+                "mergeable": "MERGEABLE", "url": f"u{n}"}
+
+    prs = [pr(1, "a hash id", "worker/al-y2o94"), pr(2, "a child", "worker/al-qddw.15"),
+           pr(3, "a tidy", "al-fix-login"), pr(4, "al-nosuch: not on the board", "feature/x")]
+    monkeypatch.setattr(curia, "gh_json", lambda args: prs if args[:2] == ["pr", "list"] else None)
+    merged, closed = [], []
+    monkeypatch.setattr(curia, "gh_run", lambda args: merged.append(args[2]) or completed(args, 0, "", ""))
+    monkeypatch.setattr(curia, "bd_close", lambda repo, bead: closed.append(bead) or f"{bead} closed")
+    rc, out, err = cli(*E(estate), "portcullis")
+    assert rc == 0, err
+    assert merged == ["1", "2"] and closed == ["al-y2o94", "al-qddw.15"]
+    assert "#3" not in out and "#4" not in out and "Landed 2, held 0, failed 0" in out
+    # a board it cannot read: nothing is taken, whatever the PRs say, and the report says why
+    merged.clear()
+    export.write_text("<<<<<<< a conflict in the export\n")
+    rc, out, _ = cli(*E(estate), "portcullis")
+    assert rc == 0 and not merged and "no beads export to check 4 open PR(s) against; nothing taken" in out
+    export.unlink()
+    rc, out, _ = cli(*E(estate), "portcullis")
+    assert rc == 0 and not merged and "nothing taken" in out and "Landed 0, held 0, failed 0" in out
 
 
 def test_init_stamps_the_mechanism_into_the_estate_fences(curia, cli, estate, tmp_path):
