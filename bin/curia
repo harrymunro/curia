@@ -52,9 +52,16 @@ MECHANISM_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_TOOLS = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Agent"]
 # How long an account is marked limited when the banner names no reset time.
 LIMIT_DEFAULT_HOURS = 5
-# The banner claude prints when an account is out of budget; matched only on a
-# run that failed, so a seat merely discussing rate limits is not caught.
-LIMIT_RE = re.compile(r"hit your (?:\w+ )?limit\b|usage limit\b|rate limit\b|out of usage credits\b", re.I)
+# A limit that lasts: a plan's window run out, or a budget spent. A plan's banner names its reset; a
+# budget's names none, since it lifts when someone raises it, and says "spend limit" or "usage limit"
+# by how the organisation is billed. A bare rate limit is a throttle, and passes (see hook_limited).
+# LIMIT_RE is any banner claude prints when an account cannot go on; matched only on a run that
+# failed, so a seat merely discussing rate limits is not caught.
+CAP_RE = re.compile(r"hit your [\w'\u2019 ]*?(?:limit|budget)\b|usage limit\b|spend limit reached\b"
+                    r"|out of usage credits\b|credit balance is too low\b", re.I)
+LIMIT_RE = re.compile(CAP_RE.pattern + r"|rate limit\b", re.I)
+# The StopFailure error types that mean the account cannot go on. A spent budget has been seen as rate_limit.
+LIMIT_ERRORS = ("rate_limit", "billing_error")
 # "resets 4:30pm (Area/City)", "resets at 5pm", "resets 16:30". Needs minutes
 # or am/pm so a stray number after "resets" is not read as an hour.
 RESET_RE = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?", re.I)
@@ -456,6 +463,9 @@ def account_burn(est: Estate, acct: str) -> str:
         left = f"{mins / 60:.1f}h" if mins >= 90 else f"{mins:.0f}m"
         return (f"{window.replace('_', '-')} {used:.0f}% resets in {left} "
                 f"(read {age(str(reading.get('at', '')))} ago by {reading.get('seat') or '?'})")
+    if reading and not any(isinstance(reading.get(w), dict) for w in ("five_hour", "seven_day", "spend_limit")):
+        return (f"no rate-limit windows on its last reading (read {age(str(reading.get('at', '')))} ago by "
+                f"{reading.get('seat') or '?'}); usage-based billing has none, so only a dead turn shows a spent budget")
     if reading:
         return f"windows all reset since the last reading ({age(str(reading.get('at', '')))} ago)"
     return "no reading yet (a seat's status line writes one)"
@@ -1334,7 +1344,7 @@ def seat_settings(est: Estate | None = None, headless: bool = False, seat: str |
     """Settings a seat session carries, passed with --settings so no account's
     settings.json is edited. The mechanism's hooks: PreCompact turns a manual
     /compact into a reminder to hand off; Stop says when the shift is over;
-    StopFailure on a rate limit marks the account and tells the launcher.
+    StopFailure on a limit or a spent budget marks the account and tells the launcher.
     Then whatever fences the estate declares in hooks.json. Interactively, a
     status line that records what Claude Code measures. Where the estate sets
     one, the skill listing for the seat on the account it resolved to
@@ -1344,7 +1354,8 @@ def seat_settings(est: Estate | None = None, headless: bool = False, seat: str |
     hooks: dict = {
         "PreCompact": [{"matcher": "manual", "hooks": [{"type": "command", "command": f"{me} hook precompact"}]}],
         "Stop": [{"hooks": [{"type": "command", "command": f"{me} hook shift"}]}],
-        "StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": f"{me} hook limited"}]}],
+        "StopFailure": [{"matcher": "|".join(LIMIT_ERRORS),
+                         "hooks": [{"type": "command", "command": f"{me} hook limited"}]}],
     }
     for event, entries in (estate_hooks(est) if est else {}).items():
         hooks.setdefault(event, []).extend(entries)
@@ -2093,6 +2104,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                      "; the --loop launcher waits for a limit to lift" if loop else
                      "; relaunch by hand when a limit lifts"), file=sys.stderr)
             notify(est, f"{title} hit a limit on {on}",
+                   (f"{cut['why']}. " if cut.get("why") else "") +
                    f"The session was ended without a handoff; its transcript is at "
                    f"{cut.get('transcript_path') or '?'}. "
                    + (f"The --loop launcher relaunches on '{nxt}'." if loop and nxt else
@@ -5986,23 +5998,25 @@ def usage_series(cfg: Path, at: str, acct: str, seat: str, sid: str, windows: di
 
 
 def hook_limited(est: Estate, seat: str, payload: dict) -> None:
-    """StopFailure on a rate limit: the turn ended because the account is out
-    of budget. Mark the account limited until it lifts, and leave the seat a
-    LIMITED marker for the launcher, which ends the session and relaunches
-    on the fallback; nothing useful can happen here without tokens."""
-    if not payload or payload.get("error_type", "rate_limit") != "rate_limit":
+    """StopFailure on a limit: the turn ended because the account cannot go
+    on. Mark the account limited until it lifts, and leave the seat a LIMITED
+    marker for the launcher, which ends the session and relaunches on the
+    fallback; nothing useful can happen here without tokens. Claude Code puts
+    the error's type in `error` and what it showed in `last_assistant_message`."""
+    if not payload or str(payload.get("error") or "rate_limit") not in LIMIT_ERRORS:
         return   # an empty payload is a hook that could not read its input, not a limit
     cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
     acct = current_account(est)
-    error = str(payload.get("error") or "")
+    banner = str(payload.get("last_assistant_message") or payload.get("error_details") or "")
     retry = payload.get("retry_after_seconds")
     used, resets, window = worst_window(usage_reading(cfg))
     if isinstance(retry, (int, float)) and not isinstance(retry, bool) and retry > 0:
         until, why = now() + dt.timedelta(seconds=float(retry)), f"retry after {retry:.0f}s"
     elif used is not None and resets is not None and used >= est.threshold("limited_at"):
         until, why = resets, f"{window} window at {used:.0f}%"
-    elif looks_limited(error):
-        until, why = limit_reset(error) or now() + dt.timedelta(hours=LIMIT_DEFAULT_HOURS), "limit banner"
+    elif CAP_RE.search(banner):
+        until, why = (limit_reset(banner) or now() + dt.timedelta(hours=LIMIT_DEFAULT_HOURS),
+                      "limit banner: " + banner.split(" \u00b7 ")[0][:80])
     else:
         until, why = now() + dt.timedelta(minutes=10), "rate limit naming no reset; ten minutes"
     if acct:
@@ -6011,7 +6025,8 @@ def hook_limited(est: Estate, seat: str, payload: dict) -> None:
     note = {"at": now().isoformat(timespec="seconds"), "account": acct or cfg.name,
             "until": until.isoformat(timespec="seconds"), "why": why,
             "session_id": str(payload.get("session_id") or ""),
-            "transcript_path": str(payload.get("transcript_path") or ""), "error": error[:300]}
+            "transcript_path": str(payload.get("transcript_path") or ""),
+            "error": (banner or str(payload.get("error") or ""))[:300]}
     # A headless run's marker carries its session id in the name: the seat may be awake interactively
     # at the same time, and that launcher must not take a review's limit for its own session's.
     headless = bool(os.environ.get("CURIA_HEADLESS")) and bool(note["session_id"])
@@ -6336,7 +6351,8 @@ state, and under it what its status line last measured - the fullest
 rate-limit window, when it resets, who read it. An account is limited
 while its config dir holds a curia-limit-until marker set in the future;
 an expired marker is removed on read. `shared = false` marks a dedicated
-account: only its own seats launch there, and no chain falls back to it.""",
+account: only its own seats launch there, and no chain falls back to it.
+An account on usage-based billing reports no windows, and says so here.""",
 
     "check": """\
 Validate the estate against itself: every seat's account exists, every
@@ -6778,8 +6794,11 @@ emptiest is taken. A reading past limited_at counts as limited until that
 window resets, marker or none. An account with `shared = false` in
 accounts.toml is only ever its own seats': never a fallback for anyone
 else, so the seats that need it always find it. With no reading on file
-the walk is markers only, as before. --account starts the walk somewhere
-other than the seat's usual account; it is a starting point, not a pin.
+the walk is markers only, as before, and so it is for an account on
+usage-based billing, whose status line reports no windows: rotate_at,
+limited_at and handoff_at never fire for it, and the first sign of a spent
+budget is a turn that dies. --account starts the walk somewhere other than
+the seat's usual account; it is a starting point, not a pin.
 
 Mid-session, the seat's own hooks keep the night alive (`curia help
 hook`). Its status line records what Claude Code measures. Its Stop hook,
@@ -6874,7 +6893,9 @@ up wrap_minutes before (default 45 minutes, estate.toml), so long turns and
 gates finish in time. --budget, in US dollars, is the recorded spend across
 this night's sessions; the seat is told to wrap at budget_wrap_at percent
 (default 90%). The launcher tracks spend, told in the environment (CURIA_SPENT),
-across the wakings that reported it. Neither ends the night mid-turn: the shift
+across the wakings that reported it. That is this seat's sessions only, as
+Claude Code estimates them at list price: what a fleet it dispatches spends
+is not counted, and the bill may differ. Neither ends the night mid-turn: the shift
 hook is what tells the seat to wrap; these set its alarm. The night ends across
 all boards (with several --repo) without moving to the next; the record says so.
 One short last waking that starts just before the margin is possible and a true
@@ -7059,7 +7080,9 @@ A headless run (`run`, `censor`) that dies on the limit banner writes this
 marker itself, reading the reset time from the banner when it names one,
 and retries down the chain. An interactive seat's StopFailure hook writes
 it when a turn dies on the limit (`curia help hook`), so by hand is for
-what the hooks did not see.""",
+what the hooks did not see. A spent budget names no reset, so its marker
+lasts five hours and the next launch after that tries again, dying once if
+it is still spent; when someone raises it, --clear takes the marker off.""",
 
     "lictor": """\
 Read-only report across every repo: stale in_progress beads, blocked beads
@@ -7324,11 +7347,12 @@ CURIA_UNTIL (ISO UTC), CURIA_BUDGET (USD), and CURIA_SPENT (recorded USD
 so far this night). Headless, or when Claude is already continuing because
 of a stop hook, it says nothing.
 
-limited: StopFailure on a rate limit, when a turn dies because the account
-is out of budget. Marks the account limited - until the retry-after the
-error names, else the measured window's reset, else the reset time in the
-banner, else a few hours; a rate limit naming no reset at all is taken as
-transient and marked for ten minutes - and leaves the seat a LIMITED
+limited: StopFailure on a rate limit or a billing error, when a turn dies
+because the account cannot go on. Marks the account limited - until the
+retry-after the error names, else the measured window's reset, else the
+reset time in the banner, else five hours for a banner that names a limit
+or budget and no reset, as a spent budget's does; a bare rate limit is
+taken as transient and marked for ten minutes - and leaves the seat a LIMITED
 marker carrying the session id and transcript path. `launch` watches for
 that marker, ends the session and relaunches (`curia help launch`). In a
 headless run the marker is named for the run (LIMITED-<session id>), so a
@@ -7398,7 +7422,7 @@ examples:
     "limit": """\
 examples:
   curia limit current --hours 5        after claude reports a usage limit
-  curia limit <account> --clear        the limit lifted early""",
+  curia limit <account> --clear        the limit lifted early, or someone raised a spent budget""",
     "status": """\
 examples:
   curia status                         the morning look: who is awake, what the offices said
@@ -7716,8 +7740,8 @@ def main() -> None:
                         "email, any case; repeatable, for someone who files under several")
     p.add_argument("--until", help="end the night at this time: HH:MM local, or ISO datetime (UTC assumed if naive); "
                    "requires --loop or --everything")
-    p.add_argument("--budget", help="end the night when recorded spend reaches this USD amount; "
-                   "requires --loop or --everything")
+    p.add_argument("--budget", help="end the night when this seat's recorded spend reaches this USD amount (Claude "
+                   "Code's estimate; a fleet it dispatches is not counted); requires --loop or --everything")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
                    help="show the estate, account, cwd, command and skill listing that would run, without launching")
     p.set_defaults(fn=cmd_launch)

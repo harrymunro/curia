@@ -108,7 +108,10 @@ weaken it to get green.
   launch, so it marks its own limit and retries down the chain; a `--loop`
   launch waits out a spent chain rather than dying overnight. Measurement is
   what Claude Code hands the status line, never an API call of our own; with
-  no reading on file the walk is markers only. A headless run tries a roster
+  no reading on file the walk is markers only, and so it is for an account on
+  usage-based billing, which reports no windows: a spent budget shows first as
+  a dead turn, and a banner naming no reset is tried again after a few hours.
+  A headless run tries a roster
   `fallback_model` on the same account before it marks the account: a limit
   may be the model's. `shared = false` accounts are
   nobody's fallback. A cut session is not carried to the next account:

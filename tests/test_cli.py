@@ -1384,8 +1384,8 @@ def test_loop_survives_a_mid_session_limit_and_relaunches_on_the_fallback(curia,
                 transcript.parent.mkdir(parents=True)
                 transcript.write_text("{}\n")
                 rc, _, _ = cli("hook", "limited", stdin=json.dumps({
-                    "session_id": sid, "transcript_path": str(transcript), "error_type": "rate_limit",
-                    "error": "You've hit your limit"}))
+                    "session_id": sid, "transcript_path": str(transcript), "error": "rate_limit",
+                    "last_assistant_message": "You've hit your limit"}))
                 assert rc == 0
             assert watch() is True   # the launcher ends the session now
             return 143
@@ -1416,18 +1416,85 @@ def test_loop_survives_a_mid_session_limit_and_relaunches_on_the_fallback(curia,
 
 def test_limited_hook_reads_the_reset_from_wherever_it_is_named(curia, cli, estate, monkeypatch, tmp_path):
     as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
-    cli("hook", "limited", stdin=json.dumps({"error_type": "rate_limit", "retry_after_seconds": 120}))
+    cli("hook", "limited", stdin=json.dumps({"error": "rate_limit", "retry_after_seconds": 120}))
     until = curia.account_limited(estate, "a")
     assert 100 < (until - curia.now()).total_seconds() <= 120
     cli(*E(estate), "limit", "a", "--clear")
-    cli("hook", "limited", stdin=json.dumps({"error_type": "rate_limit", "error": "usage limit reached, resets at 23:59"}))
+    cli("hook", "limited", stdin=json.dumps({"error": "rate_limit",
+                                             "last_assistant_message": "usage limit reached, resets at 23:59"}))
     assert curia.account_limited(estate, "a").astimezone(UTC).strftime("%H:%M") == "23:59"
     cli(*E(estate), "limit", "a", "--clear")
-    cli("hook", "limited", stdin=json.dumps({"error_type": "rate_limit", "error": "429 slow down"}))
+    cli("hook", "limited", stdin=json.dumps({"error": "rate_limit", "error_details": "429 slow down"}))
     assert 500 < (curia.account_limited(estate, "a") - curia.now()).total_seconds() <= 600
     cli(*E(estate), "limit", "a", "--clear")
-    cli("hook", "limited", stdin=json.dumps({"error_type": "overloaded", "error": "overloaded"}))
+    cli("hook", "limited", stdin=json.dumps({"error": "overloaded", "last_assistant_message": "overloaded"}))
     assert curia.account_limited(estate, "a") is None   # not a limit: nothing marked
+
+
+def test_limited_hook_tells_a_spent_budget_from_a_throttle(curia, cli, estate, monkeypatch, tmp_path):
+    # The payload as Claude Code sends it: the type in `error`, what it showed in `last_assistant_message`.
+    as_seat(monkeypatch, estate, "muse", tmp_path / "acct-a")
+    sd = estate.seat_dir("muse")
+
+    def hit(error, shown, details=""):
+        cli(*E(estate), "limit", "a", "--clear")
+        rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s", "error": error, "error_details": details,
+                                                            "last_assistant_message": shown}))
+        assert rc == 0
+        until = curia.account_limited(estate, "a")
+        return (until - curia.now()).total_seconds() if until else None
+
+    hours = 3600 * curia.LIMIT_DEFAULT_HOURS
+    # a spent budget names no reset and lifts when someone raises it: not worth retrying every ten minutes
+    individual = "You've hit your individual spend limit \u00b7 run /usage-credits to ask your admin for a higher limit"
+    assert hours - 60 < hit("rate_limit", individual, "429") <= hours
+    note = json.loads((sd / "LIMITED").read_text())
+    assert note["error"] == individual and note["why"] == "limit banner: You've hit your individual spend limit"
+    assert "You've hit your individual spend limit" in curia.session_events(sd)[-1][2]
+    assert hours - 60 < hit("rate_limit", "You've hit your org's monthly spend limit") <= hours
+    assert hours - 60 < hit("rate_limit", "You've hit your team's shared budget \u00b7 ask your admin") <= hours
+    assert hours - 60 < hit("billing_error", "Credit balance is too low") <= hours
+    # a plan's window says when it comes back
+    cli(*E(estate), "limit", "a", "--clear")
+    cli("hook", "limited", stdin=json.dumps({"error": "rate_limit",
+                                             "last_assistant_message": "You've hit your session limit \u00b7 resets 23:59"}))
+    assert curia.account_limited(estate, "a").astimezone(UTC).strftime("%H:%M") == "23:59"
+    # a bare throttle passes, and the type alone in `error` names no limit
+    assert 500 < hit("rate_limit", "API Error: Rate limit reached", "429 Too Many Requests") <= 600
+    assert 500 < hit("rate_limit", "") <= 600
+    assert hit("server_error", "You've hit your session limit") is None
+    # the hook is installed for both types, in the exact-match form StopFailure takes
+    settings = json.loads(curia.seat_settings(estate))
+    assert settings["hooks"]["StopFailure"][0]["matcher"] == "rate_limit|billing_error"
+
+
+@pytest.mark.parametrize("banner", [
+    "You've hit your session limit", "You've hit your weekly limit", "You've hit your Opus limit", "You've hit your limit",
+    "You've hit your monthly spend limit", "You've hit your individual spend limit",
+    "You've hit your org's monthly spend limit \u00b7 run /usage-credits to ask your admin for a higher limit",
+    "You've hit your channel's monthly spend limit", "You've hit your team's shared budget",
+    "You've hit your individual usage limit", "spend limit reached (daily; resets 2026-08-09 00:00 UTC)",
+    "Credit balance is too low", "API Error: Rate limit reached"])
+def test_a_headless_run_knows_every_limit_banner(curia, banner):
+    assert curia.looks_limited(banner)
+
+
+@pytest.mark.parametrize("text", ["all done, no limit reached today", "spend limit unavailable", "tests pass"])
+def test_a_headless_run_does_not_take_other_text_for_a_limit(curia, text):
+    assert not curia.looks_limited(text)
+
+
+def test_accounts_says_when_an_account_reports_no_windows(curia, estate, monkeypatch):
+    cfg = curia.account_dir(estate, "a")
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 1, 12, 0, tzinfo=UTC))
+    curia.write_json(curia.usage_path(cfg), {"at": "2026-06-01T11:00:00+00:00", "account": "a", "seat": "muse"})
+    said = curia.account_burn(estate, "a")
+    assert "no rate-limit windows" in said and "usage-based billing" in said and "muse" in said
+    assert curia.walk_chain(estate, "a", "a")[0] == "a"   # no reading of a window is no reason to rotate
+    # windows there were, and they have passed: that is another thing to say
+    curia.write_json(curia.usage_path(cfg), {"at": "2026-06-01T11:00:00+00:00", "account": "a", "seat": "muse",
+                                             "five_hour": {"used_percentage": 50, "resets_at": 1}})
+    assert "windows all reset" in curia.account_burn(estate, "a")
 
 
 def test_shift_hook_tells_a_seat_once_to_hand_off(curia, cli, estate, monkeypatch, tmp_path):
@@ -1476,7 +1543,7 @@ def test_status_shows_the_burn_and_the_launcher_records_interactive_cost(curia, 
         sid = cmd[cmd.index("--session-id") + 1]
         settings = json.loads(cmd[cmd.index("--settings") + 1])
         assert settings["statusLine"]["command"].endswith("hook usage")
-        assert settings["hooks"]["StopFailure"][0]["matcher"] == "rate_limit" and "Stop" in settings["hooks"]
+        assert settings["hooks"]["StopFailure"][0]["matcher"] == "rate_limit|billing_error" and "Stop" in settings["hooks"]
         with monkeypatch.context() as m:
             as_seat(m, estate, "muse", Path(env["CLAUDE_CONFIG_DIR"]))
             cli("hook", "usage", stdin=statusline_payload(sid, five=(33, 7200), seven=(10, 86400), cost=2.5, duration=1800000))
@@ -2244,15 +2311,15 @@ def test_a_headless_limit_is_the_runs_own_and_an_empty_payload_is_not_a_limit(cu
     assert rc == 0 and not (sd / "LIMITED").exists() and curia.account_limited(estate, "a") is None
     # headless, the marker is named for the run, so a launcher watching LIMITED never takes it
     monkeypatch.setenv("CURIA_HEADLESS", "1")
-    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-h", "error_type": "rate_limit",
-                                                         "error": "You've hit your limit"}))
+    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-h", "error": "rate_limit",
+                                                         "last_assistant_message": "You've hit your limit"}))
     assert rc == 0 and (sd / "LIMITED-s-h").exists() and not (sd / "LIMITED").exists()
     assert curia.account_limited(estate, "a") and not curia.marker_names(sd / "LIMITED", "s-h")
     # interactively the marker names its session, and only that launcher takes it
     monkeypatch.delenv("CURIA_HEADLESS")
     curia.limit_marker(estate, "a").unlink()
-    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-i", "error_type": "rate_limit",
-                                                         "error": "You've hit your limit"}))
+    rc, _, _ = cli("hook", "limited", stdin=json.dumps({"session_id": "s-i", "error": "rate_limit",
+                                                         "last_assistant_message": "You've hit your limit"}))
     assert rc == 0 and curia.marker_names(sd / "LIMITED", "s-i") and not curia.marker_names(sd / "LIMITED", "s-x")
     curia.write_json(sd / "LIMITED", {"account": "a"})   # a hook that did not know its session
     assert curia.marker_names(sd / "LIMITED", "anyone")
