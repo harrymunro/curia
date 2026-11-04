@@ -919,6 +919,28 @@ def spend(est: Estate, since: dt.datetime | None = None) -> tuple[dict[str, dict
     return by_acct, by_seat
 
 
+def fleet_of(est: Estate, office: str) -> list[str]:
+    """The fleet seats an office manages, by roster key."""
+    return [k for k, v in est.roster.items()
+            if v.get("kind") == "fleet" and str(v.get("managed_by") or "").lower() == office.lower()]
+
+
+def fleet_spend(est: Estate, office: str, since: dt.datetime) -> float:
+    """What the jobs of an office's fleet have cost since `since`, by each
+    worker's assignments.log: the work and its review, whichever seat reviewed
+    it. A job counts when it returns, so one still running is not in the figure."""
+    total = 0.0
+    for k in fleet_of(est, office):
+        for line in read(est.seat_dir(k) / "assignments.log").splitlines():
+            bits = line.split(" ", 2)
+            if len(bits) < 3 or bits[0] not in ("returned", "reviewed", "done"):
+                continue
+            cost = detail_field(bits[2], "cost").lstrip("$")
+            if cost and (parse_iso(bits[1]) or since) >= since:
+                total += float(cost)
+    return total
+
+
 def mail_sender(est: Estate) -> tuple[str, str]:
     """Who is speaking: (roster key, display name). A seat when CURIA_SEAT
     names one on this roster, else the principal."""
@@ -1748,7 +1770,7 @@ def board_at(est: Estate, issues: list[dict], t: dt.datetime) -> dict | None:
 
 
 def night_orders(until: dt.datetime | None = None, budget: float | None = None,
-                 wrap_minutes: float = 45.0, budget_wrap_at: float = 90.0) -> str:
+                 wrap_minutes: float = 45.0, budget_wrap_at: float = 90.0, fleet: bool = False) -> str:
     """The seat's orders about a night with a deadline and/or budget."""
     parts = []
     if until:
@@ -1760,8 +1782,9 @@ def night_orders(until: dt.datetime | None = None, budget: float | None = None,
                     "disk true, and hand off. Whatever your charter says closes a night (a push, a promotion) "
                     "must start early enough to finish before the deadline, not before the margin.")
     if budget:
-        parts.append(f"The night's budget is ${budget:.0f} of recorded spend; the shift hook tells you to "
-                    f"wrap up at {int(budget_wrap_at)}%.")
+        parts.append(f"The night's budget is ${budget:.0f} of recorded spend"
+                     + (", your fleet's jobs and their reviews included" if fleet else "")
+                     + f"; the shift hook tells you to wrap up at {int(budget_wrap_at)}%.")
     return " ".join(parts) if parts else ""
 
 
@@ -1918,9 +1941,12 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         local = until_dt.astimezone().strftime("%H:%M")
         z = until_dt.strftime("%H:%M")
         print(f"curia: {title}'s night ends at {local} local ({z}Z)")
+    night_since = None   # --budget: when this night's spend starts counting; log stamps are in whole seconds
     if budget_float is not None:
+        night_since = now().replace(microsecond=0)
         night_terms["budget"] = budget_float
         night_terms["budget_wrap_at"] = budget_wrap_at
+        night_terms["fleet"] = bool(fleet_of(est, name))
     night_ord = night_orders(**night_terms) if night_terms else ""
     if night_terms:
         log_fields = {}
@@ -1971,14 +1997,17 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             log_session(sd, "deadline", f"until={until_dt.isoformat()} remaining={len(remaining) if everything else '?'}")
             notify(est, f"{title}: night ended at the deadline", msg)
             return True
-        if budget_float is not None and spent >= budget_float:
-            msg = f"{title}'s night spent ${spent:.2f} of the ${budget_float:.2f} budget"
+        fleet = fleet_spend(est, name, night_since) if night_since else 0.0
+        if budget_float is not None and spent + fleet >= budget_float:
+            msg = (f"{title}'s night spent ${spent + fleet:.2f} of the ${budget_float:.2f} budget"
+                   + (f" (${fleet:.2f} of it by its fleet)" if fleet else ""))
             if everything:
                 b = board(est, repo, by)
                 remaining = b["ready"] + b["working"] + b["blocked"]
                 msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}" + left_alone(b)
             print(f"curia: {msg}; not waking it again")
-            log_session(sd, "budget", f"spent={spent:.2f} budget={budget_float:.2f}")
+            log_session(sd, "budget", f"spent={spent + fleet:.2f} budget={budget_float:.2f}"
+                                      + (f" fleet={fleet:.2f}" if fleet else ""))
             notify(est, f"{title}: night ended on budget", msg)
             return True
         return False
@@ -2072,6 +2101,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if budget_float is not None:
             env["CURIA_BUDGET"] = str(budget_float)
         env["CURIA_SPENT"] = str(spent)
+        if night_since:
+            env["CURIA_NIGHT_SINCE"] = night_since.isoformat()
         if loop or everything:
             env["CURIA_LOOP"] = "1"   # the shift hook may promise a relaunch only when there is one
         prime = prime_file(est, name, recalled=recall_for(est, name, recall_query(est, name, say)))
@@ -5745,6 +5776,9 @@ def cmd_progress(a) -> None:
     mins = sum(r["minutes"] or 0.0 for r in rows)
     handoffs = sum(1 for r in rows if r["handoff"])
     totals = f"{len(rows)} waking(s), {handoffs} handoff(s), ${cost:.2f}, {mins:.0f} minutes"
+    fleet = fleet_spend(est, name, since)
+    if fleet:
+        totals += f" (its fleet ${fleet:.2f} more)"
     if live:
         labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
         who: dict[str, int] = {}
@@ -6117,9 +6151,12 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
         session_cost = 0.0
         if session_usage and isinstance(session_usage.get("cost_usd"), (int, float)):
             session_cost = session_usage["cost_usd"]
-        total = spent + session_cost
+        since = parse_iso(os.environ.get("CURIA_NIGHT_SINCE", ""))   # a waking can outlast many of the fleet's jobs
+        fleet = fleet_spend(est, seat, since) if since else 0.0
+        total = spent + session_cost + fleet
         if total >= budget * wrap_at_pct / 100:
-            reasons.append(f"recorded spend ${spent:.2f} of the night's ${budget:.2f} budget")
+            reasons.append(f"recorded spend ${total:.2f} of the night's ${budget:.2f} budget"
+                           + (f", ${fleet:.2f} of it by your fleet" if fleet else ""))
     if not reasons:
         return
     sd.mkdir(parents=True, exist_ok=True)
@@ -6919,9 +6956,12 @@ up wrap_minutes before (default 45 minutes, estate.toml), so long turns and
 gates finish in time. --budget, in US dollars, is the recorded spend across
 this night's sessions; the seat is told to wrap at budget_wrap_at percent
 (default 90%). The launcher tracks spend, told in the environment (CURIA_SPENT),
-across the wakings that reported it. That is this seat's sessions only, as
-Claude Code estimates them at list price: what a fleet it dispatches spends
-is not counted, and the bill may differ. Neither ends the night mid-turn: the shift
+across the wakings that reported it, and reads what its fleet has spent since
+the launch: each job and its review, whichever seat reviewed it, from the
+workers' assignments.log. All of it is Claude Code's estimate at list price, so
+the bill may differ, and it is counted on any account, a flat-rate one too. A
+job counts when it returns, so a night can overshoot by what is still running;
+a seat woken with `run` outside the fleet is not counted. Neither ends the night mid-turn: the shift
 hook is what tells the seat to wrap; these set its alarm. The night ends across
 all boards (with several --repo) without moving to the next; the record says so.
 One short last waking that starts just before the margin is possible and a true
@@ -7315,7 +7355,8 @@ line of what its handoff put under "For the principal". Then the board as
 it stands now, read the way the launcher reads it (origin's export after
 a fetch, else the file on disk), with the distance to the loop's end and
 who the human-waiting beads wait on; and the totals for the window:
-wakings, handoffs, spend, minutes, beads closed and filed.
+wakings, handoffs, spend, minutes, beads closed and filed. The totals add
+what its fleet's jobs and their reviews cost, as --budget counts them.
 
 The window is the latest launcher's sessions (those sharing its pid on
 their start lines), so a --loop or --everything night is one view;
@@ -7766,8 +7807,8 @@ def main() -> None:
                         "email, any case; repeatable, for someone who files under several")
     p.add_argument("--until", help="end the night at this time: HH:MM local, or ISO datetime (UTC assumed if naive); "
                    "requires --loop or --everything")
-    p.add_argument("--budget", help="end the night when this seat's recorded spend reaches this USD amount (Claude "
-                   "Code's estimate; a fleet it dispatches is not counted); requires --loop or --everything")
+    p.add_argument("--budget", help="end the night when recorded spend reaches this USD amount: this seat's sessions, "
+                   "its fleet's jobs and their reviews, as Claude Code estimates them; requires --loop or --everything")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
                    help="show the estate, account, cwd, command and skill listing that would run, without launching")
     p.set_defaults(fn=cmd_launch)

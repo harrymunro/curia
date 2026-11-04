@@ -2019,6 +2019,103 @@ def test_parse_until_handles_hhmm_and_iso_formats(curia, monkeypatch):
         curia.parse_until("2025-12-31T10:00:00Z")
 
 
+def worker_log(estate, *lines):
+    sd = estate.seat_dir("worker")
+    sd.mkdir(exist_ok=True)
+    with open(sd / "assignments.log", "a") as f:
+        f.write("".join(line + "\n" for line in lines))
+
+
+def test_fleet_spend_is_the_jobs_and_their_reviews_since_the_night_began(curia, estate):
+    worker_log(estate,
+               "returned 2026-06-01T09:00:00+00:00 bead=al-0 rc=0 session=s0 cost=$100.00",   # before the night
+               "dispatch 2026-06-01T12:00:00+00:00 bead=al-1 repo=alpha branch=b worktree=/w by=Warden",
+               "returned 2026-06-01T12:30:00+00:00 bead=al-1 rc=0 session=s1 cost=$4.00 turns=3 minutes=30.0",
+               "reviewed 2026-06-01T12:40:00+00:00 bead=al-1 by=muse rc=0 session=s2 cost=$1.50 turns=1",   # outside the fleet
+               "done 2026-06-01T12:50:00+00:00 bead=al-2 prompt=x.md rc=0 session=s3 cost=$0.50",
+               "returned 2026-06-01T13:00:00+00:00 bead=al-3 rc=124 session=s4")   # cut off: reports no cost
+    since = dt.datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    assert curia.fleet_spend(estate, "warden", since) == 6.0
+    assert curia.fleet_spend(estate, "WARDEN", since) == 6.0   # the roster's case or any
+    assert curia.fleet_spend(estate, "muse", since) == 0.0     # a seat that manages no fleet
+    assert curia.fleet_of(estate, "warden") == ["worker"] and curia.fleet_of(estate, "muse") == []
+
+
+def test_a_budget_night_ends_on_what_the_fleet_spent(curia, cli, estate, monkeypatch, tmp_path):
+    write_board(estate.root / "alpha" / ".beads" / "issues.jsonl", [by_bead("al-1")])
+    told = tmp_path / "told.txt"
+    meta = (estate.dir / "estate.toml").read_text().replace(
+        'notify = ""', f'notify = \'printf "%s\\n" "$CURIA_SUBJECT" >> {told}\'')
+    (estate.dir / "estate.toml").write_text(meta)
+    wakings = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        wakings.append((cmd[-1], dict(env)))
+        sid = cmd[cmd.index("--session-id") + 1]
+        curia.write_json(Path(env["CLAUDE_CONFIG_DIR"]) / "curia-usage" / f"{sid}.json", {"cost_usd": 10.0})
+        curia.assignments_log(estate.seat_dir("worker"), "returned", "bead=al-1 rc=0 session=w1 cost=$60.00")
+        curia.assignments_log(estate.seat_dir("worker"), "reviewed", "bead=al-1 by=muse rc=0 session=w2 cost=$35.00")
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything", "--budget", "100")
+    assert rc == 0, err
+    assert len(wakings) == 1   # $10 of its own would have woken it again; $95 of its fleet's does not
+    orders, env = wakings[0]
+    assert "$100 of recorded spend, your fleet's jobs and their reviews included" in orders
+    assert curia.parse_iso(env["CURIA_NIGHT_SINCE"]) and env["CURIA_SPENT"] == "0.0"
+    assert "night spent $105.00 of the $100.00 budget ($95.00 of it by its fleet)" in out
+    assert told.read_text().splitlines()[-1] == "Warden: night ended on budget"
+    last = curia.session_events(estate.seat_dir("warden"))[-1]
+    assert last[0] == "budget" and last[2] == "spent=105.00 budget=100.00 fleet=95.00"
+
+
+def test_a_budget_with_no_fleet_spend_reads_as_it_did(curia, cli, estate, monkeypatch, tmp_path):
+    # a seat with no fleet is not told of one
+    assert "fleet" not in curia.night_orders(budget=100.0)
+    write_board(estate.root / "alpha" / ".beads" / "issues.jsonl", [by_bead("al-1")])
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        sid = cmd[cmd.index("--session-id") + 1]
+        curia.write_json(Path(env["CLAUDE_CONFIG_DIR"]) / "curia-usage" / f"{sid}.json", {"cost_usd": 100.0})
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything", "--budget", "100")
+    assert rc == 0, err
+    assert "night spent $100.00 of the $100.00 budget;" in out and "by its fleet" not in out
+    assert curia.session_events(estate.seat_dir("warden"))[-1][2] == "spent=100.00 budget=100.00"
+
+
+def test_shift_hook_reads_the_fleets_spend_as_it_stands(curia, cli, estate, monkeypatch, tmp_path):
+    as_seat(monkeypatch, estate, "warden", tmp_path / "acct-a")
+    sd = estate.seat_dir("warden")
+    curia.log_session(sd, "start", f"account=a cwd=/x session=s1 pid={os.getpid()}")
+    monkeypatch.setenv("CURIA_BUDGET", "100")
+    monkeypatch.setenv("CURIA_SPENT", "10")
+    monkeypatch.setenv("CURIA_NIGHT_SINCE", (curia.now() - dt.timedelta(hours=1)).isoformat())
+    curia.assignments_log(estate.seat_dir("worker"), "returned", "bead=al-1 rc=0 session=w1 cost=$50.00")
+    rc, _, err = cli("hook", "shift", stdin=json.dumps({"session_id": "s1"}))
+    assert rc == 0 and not (sd / "SHIFT-OVER").exists()   # $60 of $100: the budget is not near
+    curia.assignments_log(estate.seat_dir("worker"), "reviewed", "bead=al-1 by=muse rc=0 session=w2 cost=$35.00")
+    rc, _, err = cli("hook", "shift", stdin=json.dumps({"session_id": "s1"}))
+    assert rc == 2 and "recorded spend $95.00 of the night's $100.00 budget, $85.00 of it by your fleet" in err
+
+
+def test_progress_adds_what_the_fleet_cost(curia, cli, estate, monkeypatch):
+    sd = estate.seat_dir("warden")
+    sd.mkdir(exist_ok=True)
+    (sd / "sessions.log").write_text("start 2026-06-01T12:00:00+00:00 account=a model=m cwd=/x session=s1 pid=77\n"
+                                     "end 2026-06-01T15:00:00+00:00 rc=0 session=s1 cost=$3.00 minutes=180.0\n")
+    worker_log(estate, "returned 2026-06-01T13:00:00+00:00 bead=al-1 rc=0 session=w1 cost=$6.00")
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 2, 12, 0, tzinfo=UTC))
+    rc, out, err = cli(*E(estate), "progress", "warden")
+    assert rc == 0, err
+    assert "1 waking(s), 0 handoff(s), $3.00, 180 minutes (its fleet $6.00 more)." in out
+
+
 def test_until_and_budget_without_loop_die(cli, estate):
     rc, _, err = cli(*E(estate), "launch", "muse", "--until", "06:30")
     assert rc == 2 and "loop to end" in err
