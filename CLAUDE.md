@@ -122,6 +122,11 @@ weaken it to get green.
   interactively and reviewing headless at once never ends the wrong one.
   Every account limited, a `--loop` launcher waits in fifteen-minute slices
   and re-walks the chain after each.
+- `account_env` is the one place a session's account reaches its environment.
+  An account on `~/.claude` runs with `CLAUDE_CONFIG_DIR` unset: Claude Code keys
+  the stored login on the variable being set, so naming the default dir is a
+  second login beside a bare `claude`'s, and it expires unseen. Every other
+  account names its dir, and logs in under that exact name.
 - How the principal is told is the estate's to say: `notify` in estate.toml is
   a command, and the mechanism only ever calls it with a subject, a body and a
   report path. Nothing here knows a channel.

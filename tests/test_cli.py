@@ -193,6 +193,39 @@ def test_launch_records_session_clears_stale_restart_and_loops(curia, cli, estat
     assert "rc=0" in events[1][2]
 
 
+def test_a_seat_on_the_default_config_dir_runs_as_a_bare_claude(curia, cli, estate, monkeypatch, tmp_path):
+    # Naming ~/.claude would be a second stored login beside a bare `claude`'s, so
+    # the variable stays unset there, even when the launching shell carried another
+    # account's; any other account still names its dir.
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "acct-b"))
+    (estate.dir / "accounts.toml").write_text(
+        f'[accounts.a]\nconfig_dir = "~/.claude"\nfallback = "b"\n'
+        f'[accounts.b]\nconfig_dir = "{tmp_path / "acct-b"}"\nfallback = ""\n')
+    seen = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        seen.append(env)
+        return completed(cmd, 0, result_json("ok")) if "-p" in cmd else 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, _, err = cli(*E(estate), "launch", "muse", "--say", "hello")   # interactive
+    assert rc == 0, err
+    brief = tmp_path / "brief.md"
+    brief.write_text("Do the thing.\n")
+    rc, _, err = cli(*E(estate), "run", "muse", "--prompt", str(brief))   # headless
+    assert rc == 0, err
+    assert len(seen) == 2 and all("CLAUDE_CONFIG_DIR" not in env for env in seen)
+    rc, out, _ = cli(*E(estate), "launch", "muse", "--print-cmd")
+    assert rc == 0 and f"CLAUDE_CONFIG_DIR=<unset: {home / '.claude'}>" in out
+    assert curia.account_env(tmp_path / "acct-b")["CLAUDE_CONFIG_DIR"] == str(tmp_path / "acct-b")
+    # the record still knows which account an unset variable means
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert curia.current_account(curia.Estate(estate.dir)) == "a"
+
+
 def test_launch_in_a_repo_starts_there_and_refuses_fleet(curia, cli, estate, monkeypatch):
     monkeypatch.chdir(estate.root / "alpha" / "sub")
     rc, out, _ = cli(*E(estate), "launch", "muse", "--print-cmd")

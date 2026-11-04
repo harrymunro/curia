@@ -352,6 +352,30 @@ def account_dir(est: Estate, acct: str) -> Path:
     return Path(os.path.expanduser(est.accounts[acct]["config_dir"]))
 
 
+def is_default_config_dir(cfg: Path) -> bool:
+    return cfg.resolve() == Path(os.path.expanduser("~/.claude")).resolve()
+
+
+def account_env(cfg: Path, **extra: str) -> dict[str, str]:
+    """The environment a session on this account starts in. Claude Code's default
+    config dir is a different login once it is named: the stored login is keyed on
+    CLAUDE_CONFIG_DIR being set, so naming ~/.claude makes a second login beside
+    the one a bare `claude` uses, and that one expires unseen. There the variable
+    is left unset, clearing one the launching shell carried, so a seat on ~/.claude
+    is what typing `claude` gets. Every other account names its dir."""
+    env = dict(os.environ, **extra)
+    if is_default_config_dir(cfg):
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(cfg)
+    return env
+
+
+def config_dir_shown(cfg: Path) -> str:
+    """How --print-cmd says what account_env does."""
+    return f"CLAUDE_CONFIG_DIR=<unset: {cfg}>" if is_default_config_dir(cfg) else f"CLAUDE_CONFIG_DIR={cfg}"
+
+
 def limit_marker(est: Estate, acct: str) -> Path:
     return account_dir(est, acct) / "curia-limit-until"
 
@@ -1865,7 +1889,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     own = s.get("account", "")
     if print_cmd:
         acct, cfg = resolve_account(est, want, own)
-        print("CURIA_ESTATE=" + str(est.dir) + " CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name
+        print("CURIA_ESTATE=" + str(est.dir) + " " + config_dir_shown(cfg) + " CURIA_SEAT=" + name
               + " cwd=" + str(home))
         print("claude --name " + shlex.quote(title) + " --model " + s.get("model", "?") +
               " --session-id <new uuid> --append-system-prompt-file <prime:" +
@@ -2041,7 +2065,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         acct, cfg = resolve_account(est, want, own)  # dies when the chain is spent and there is no loop to wait in
         for linked in ensure_skills(cfg):
             print(f"curia: linked the {linked} skill into {cfg.name}")
-        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
+        env = account_env(cfg, CURIA_SEAT=name, CURIA_ESTATE=str(est.dir))
         env.pop("CURIA_JEV_KEY", None)   # the judgment key is the launcher's, never a session's
         if until_dt:
             env["CURIA_UNTIL"] = until_dt.isoformat()
@@ -2165,7 +2189,7 @@ def cmd_run(a) -> None:
     if a.print_cmd:
         acct, cfg = resolve_account(est, s.get("account", ""), s.get("account", ""))
         model = headless_model(s, a.model)
-        print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(cwd))
+        print(config_dir_shown(cfg) + " CURIA_SEAT=" + name + " cwd=" + str(cwd))
         print("claude -p <prompt:" + str(len(prompt)) + " chars + journal orders> --output-format json"
               " --append-system-prompt-file <prime:" + str(len(build_prime(est, name))) + " chars>" +
               (" --model " + model if model else "") +
@@ -2321,8 +2345,8 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
         usual = headless_model(s)
         seconded = usual if model_now and usual and model_now != usual else None
         prime = prime_file(est, name, journal_path=journal, model=model_now, seconded=seconded, recalled=recalled)
-        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(cfg), CURIA_SEAT=name, CURIA_ESTATE=str(est.dir),
-                   CURIA_HEADLESS="1", CURIA_JOURNAL=str(journal))   # the one record file this waking may write
+        env = account_env(cfg, CURIA_SEAT=name, CURIA_ESTATE=str(est.dir),
+                          CURIA_HEADLESS="1", CURIA_JOURNAL=str(journal))   # the one record file this waking may write
         env.pop("CURIA_JEV_KEY", None)
         sid = str(uuid.uuid4())
         orders = JOURNAL_ORDERS.format(path=journal, seconded=SECONDED_ORDERS.format(model=model_now)
@@ -4750,7 +4774,7 @@ def cmd_dispatch(a) -> None:
     if a.print_cmd:
         acct, cfg = resolve_account(est, s.get("account", ""), s.get("account", ""))
         print(f"worktree {subs['worktree']} on branch {subs['branch']} off {r.get('integration_branch', '?')}")
-        print("CLAUDE_CONFIG_DIR=" + str(cfg) + " CURIA_SEAT=" + name + " cwd=" + subs["worktree"])
+        print(config_dir_shown(cfg) + " CURIA_SEAT=" + name + " cwd=" + subs["worktree"])
         print(f"claude -p <{ppath.name}:{len(template)} chars + journal orders> --model "
               f"{headless_model(s, a.model) or '?'}" + (f"; then review by {reviewer[0]}" if reviewer else ""))
         return
@@ -6352,7 +6376,9 @@ rate-limit window, when it resets, who read it. An account is limited
 while its config dir holds a curia-limit-until marker set in the future;
 an expired marker is removed on read. `shared = false` marks a dedicated
 account: only its own seats launch there, and no chain falls back to it.
-An account on usage-based billing reports no windows, and says so here.""",
+An account on usage-based billing reports no windows, and says so here.
+A seat on ~/.claude runs with CLAUDE_CONFIG_DIR unset, as a bare `claude`
+does: naming that dir would be a second stored login that expires unseen.""",
 
     "check": """\
 Validate the estate against itself: every seat's account exists, every

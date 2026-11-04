@@ -7,6 +7,9 @@
 # thresholds; the chain stops at a repeat. shared = false makes an account
 # its own seats' only: no other seat's chain falls back to it, so those seats
 # always find it, and a client's account never carries a seat that is not on it.
+# A seat on ~/.claude runs with CLAUDE_CONFIG_DIR unset, the login a bare `claude`
+# uses; every other config_dir is passed as CLAUDE_CONFIG_DIR, and needs a login of
+# its own (`CLAUDE_CONFIG_DIR=<dir> claude auth login`).
 
 [accounts.main]
 config_dir = "~/.claude"
