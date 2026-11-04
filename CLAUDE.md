@@ -168,7 +168,10 @@ weaken it to get green.
   asks for. The default review brief keeps the board convergent for the same
   reason: a reviewer fixes on the branch or hands the bead back, and never
   files a new bead. An estate whose reviews file findings will find the loop
-  working its own reviews, not the backlog.
+  working its own reviews, not the backlog. `--by` narrows the loop to the
+  beads a person filed, by exact name or email from the bead's own record,
+  never by judgment; those beads are still sorted against the whole board,
+  and the orders, not a fence, keep the seat off the rest.
 - Mail is a file the reader archives. `seats/<seat>/mail.md` is read into the
   prime at every waking until the seat runs `curia mail <seat> --archive`;
   nothing archives it silently, and a seat mails a seat, never the outside.

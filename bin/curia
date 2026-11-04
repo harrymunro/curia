@@ -39,6 +39,7 @@ import textwrap
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -1581,25 +1582,39 @@ def board_export(est: Estate, repo: str) -> tuple[str, str, bool]:
     return local.read_text(), "the export on disk", True
 
 
-def board(est: Estate, repo: str) -> dict:
+def filed_by(i: dict, by: list[str]) -> bool:
+    """Whether one of `by` filed this bead: its created_by (the name it was
+    filed under) or owner (the filer's email), the whole value, in any case.
+    Part of a name is no match; a night's scope is not a guess."""
+    who = {w.casefold() for w in by}
+    return bool(who & {str(i.get(k) or "").casefold() for k in ("created_by", "owner")})
+
+
+def board(est: Estate, repo: str, by: list[str] | None = None) -> dict:
     """The repo's beads export sorted for a night's work. ready: open and
     nothing open blocks it. working: in progress. blocked: by open beads on
     the board, which will come through. human: waiting on a person - a label
     from `human_labels`, a blocked bead with nothing open on the board
     blocking it, or a bead blocked only by such beads or by ids not on the
     board. closed: how many are. source: where the export was read from (see
-    board_export). issues: the export's beads as read. Only as fresh as the
-    last export."""
+    board_export). issues: the export's beads as read, all of them. by: only
+    the beads those people filed are sorted (see sort_board). Only as fresh as
+    the last export."""
     text, source, fresh = board_export(est, repo)
     issues = [json.loads(line) for line in text.splitlines() if line.strip()]
-    out = sort_board(est, issues)
+    out = sort_board(est, issues, by)
     out.update({"source": source, "fresh": fresh, "issues": issues})
     return out
 
 
-def sort_board(est: Estate, issues: list[dict]) -> dict:
+def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None) -> dict:
     """The beads of an export sorted for a night's work: ready, working,
-    blocked, human and closed, as `board` says."""
+    blocked, human and closed, as `board` says. With `by`, only the beads
+    those people filed are sorted, against the whole board: a blocker someone
+    else closed is no blocker, and one still open is off this night's board,
+    so what it blocks waits on a person. others: the open beads left out."""
+    mine = [i for i in issues if not by or filed_by(i, by)]
+    scope = {i["id"] for i in mine}
     status = {i["id"]: i.get("status") for i in issues}
     labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
     recorded = {i["id"]: [d["depends_on_id"] for d in i.get("dependencies", []) if d.get("type") == "blocks"]
@@ -1607,20 +1622,21 @@ def sort_board(est: Estate, issues: list[dict]) -> dict:
     blockers = {k: [b for b in v if status.get(b) != "closed"] for k, v in recorded.items()}   # still open
     # blocked with no blocker on record is blocked by something off the board: a person.
     # Blocked with every blocker closed is merely not flipped back yet; it is ready.
-    human = {i["id"] for i in issues if i.get("status") != "closed"
+    human = {i["id"] for i in mine if i.get("status") != "closed"
              and (set(i.get("labels") or []) & labels or (i.get("status") == "blocked" and not recorded[i["id"]]))}
     grew = True
     while grew:   # blocked only by what waits on a person waits on a person
         grew = False
-        for i in issues:
+        for i in mine:
             if i["id"] in human or i.get("status") == "closed" or not blockers[i["id"]]:
                 continue
-            if all(b in human or b not in status for b in blockers[i["id"]]):
+            if all(b in human or b not in scope for b in blockers[i["id"]]):
                 human.add(i["id"])
                 grew = True
     out: dict = {"ready": [], "working": [], "blocked": [], "human": [],
-                 "closed": sum(1 for i in issues if i.get("status") == "closed")}
-    for i in issues:
+                 "closed": sum(1 for i in mine if i.get("status") == "closed"),
+                 "others": [i for i in issues if i["id"] not in scope and i.get("status") != "closed"]}
+    for i in mine:
         st = i.get("status")
         if st == "closed":
             continue
@@ -1700,14 +1716,69 @@ def night_orders(until: dt.datetime | None = None, budget: float | None = None,
     return " ".join(parts) if parts else ""
 
 
-def everything_orders(repo: str, b: dict, night: str = "") -> str:
-    """Tonight's orders for a seat working a board until it is clear."""
+def by_field(by: list[str]) -> str:
+    """A --by as one sessions.log field; names have spaces and detail_field stops at one."""
+    return ",".join(urllib.parse.quote(w, safe="@") for w in by)
+
+
+def by_read(field: str) -> list[str] | None:
+    """A by= field back as the names given."""
+    return [urllib.parse.unquote(w) for w in field.split(",")] if field else None
+
+
+def by_others(b: dict) -> str:
+    """The open beads a --by left out of a board, and who filed them."""
+    who: dict[str, int] = {}
+    for i in b["others"]:
+        k = str(i.get("created_by") or i.get("owner") or "?")
+        who[k] = who.get(k, 0) + 1
+    named = ", ".join(f"{k} {v}" for k, v in sorted(who.items(), key=lambda kv: (-kv[1], kv[0])))
+    return f"{len(b['others'])} open by others" + (f" ({named})" if named else "")
+
+
+def by_checked(est: Estate, repos: list[str], by: list[str]) -> list[str]:
+    """A --by read against every board given, before the first is worked: a
+    name that filed nothing on any of them is a slip, and left alone it would
+    read as a clear board. Says what each board comes to."""
+    by = [w.strip() for w in by]
+    if not all(by):
+        die("--by wants a name or an email; this one is empty")
+    boards = {r: board(est, r, by) for r in repos}
+    issues = [i for b in boards.values() for i in b["issues"]]
+    unknown = [w for w in by if not any(filed_by(i, [w]) for i in issues)]
+    if unknown:
+        filers: dict[str, int] = {}
+        for i in issues:
+            k = f"{i.get('created_by') or '?'} <{i.get('owner') or '?'}>"
+            filers[k] = filers.get(k, 0) + 1
+        listed = ", ".join(f"{k} {v}" for k, v in sorted(filers.items(), key=lambda kv: (-kv[1], kv[0])))
+        die(f"--by: no bead on {', '.join(repos)} was filed by {', '.join(unknown)}. It takes a whole name or email, "
+            f"any case. Filed there: {listed or 'nothing'}")
+    for r, b in boards.items():
+        c = board_counts(b)
+        print(f"curia: {r}, beads by {', '.join(by)} only: {c['workable']} workable, {c['human']} waiting on a person, "
+              f"{c['closed']} closed; {by_others(b)} left alone")
+    return by
+
+
+def everything_orders(repo: str, b: dict, night: str = "", by: list[str] | None = None) -> str:
+    """Tonight's orders for a seat working a board until it is clear. With
+    `by`, every id is named: the list is the scope, so a dozen and an ellipsis
+    would leave the seat unable to tell what is its own."""
     def ids(xs: list) -> str:
-        return (", ".join(i["id"] for i in xs[:12]) + (" ..." if len(xs) > 12 else "")) or "none"
+        shown = xs if by else xs[:12]
+        return (", ".join(i["id"] for i in shown) + (" ..." if len(xs) > len(shown) else "")) or "none"
+    scope = ""
+    if by:
+        scope = (f"Tonight's scope: only beads filed by {' or '.join(by)}, which are the ids named below. "
+                 f"{by_others(b)} are not yours tonight: do not claim, work, dispatch, close or change them, whatever "
+                 "`bd ready`, a skill or your charter would pick. A bead of yours blocked only by one of theirs "
+                 "is counted as waiting on a human. ")
     board_orders = (f"Tonight's orders: work {repo}'s board until nothing remains that is not waiting on a human. "
-            f"As of this waking (the board read from {b.get('source', 'the export on disk')}): "
+            f"{scope}As of this waking (the board read from {b.get('source', 'the export on disk')}): "
             f"{len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
-            f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board, "
+            f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board"
+            + (f" ({ids(b['blocked'])})" if by else "") + ", "
             f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
             "handoff what would unblock each). Per your charter: claim what is ready, design and dispatch or "
             "implement, get it reviewed and landed, close it, and move to the next. When the shift hook says "
@@ -1724,18 +1795,21 @@ def cmd_launch(a) -> None:
     est = find_estate(a.estate, a.seat)
     launch_seat(est, a.seat, repo=a.repo, loop=a.loop, account=a.account,
                 say=a.say, print_cmd=a.print_cmd, everything=a.everything,
-                until=a.until, budget=a.budget)
+                until=a.until, budget=a.budget, by=a.by)
 
 
 def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, loop: bool = False,
                 account: str | None = None, say: str | None = None,
                 print_cmd: bool = False, everything: bool = False,
-                until: str | None = None, budget: str | None = None) -> None:
+                until: str | None = None, budget: str | None = None,
+                by: list[str] | None = None) -> None:
     """Wake a seat interactively. `launch` and `ingest` both come here. `repo`
     is where the session starts; several are only for --everything, which
-    works their boards in that order."""
+    works their boards in that order, and only the beads `by` filed if given."""
     if (until or budget) and not loop and not everything:
         die("a deadline needs a loop to end; add --loop or --everything")
+    if by and not everything:
+        die("--by narrows a board; add --everything")
     name, s = est.seat(seat)
     if s.get("kind") == "fleet":
         die(f"{name} is a fleet seat; it is dispatched by {s.get('managed_by', 'its office')}, "
@@ -1758,6 +1832,8 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if not repo:
             die("--everything wants a repo to work: --repo <repo>, or launch from inside one")
         loop = True
+        if by:
+            by = by_checked(est, repos, by)
     want = account or s.get("account", "")
     if want not in est.accounts:
         die(f"account '{want}' is not in accounts.toml ({', '.join(est.accounts)})")
@@ -1828,6 +1904,10 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     handed_off, last_tail = False, ""   # the session just ended wrote its handoff; what its end line said
     last_need: float | None = None      # jev's reading of whether that handoff waits on the principal
 
+    def left_alone(b: dict) -> str:
+        """What a --by night says it did not touch, wherever it says the board is done or stuck."""
+        return f" Beads by {', '.join(by)} only; {by_others(b)} left alone." if by else ""
+
     def check_night_over() -> bool:
         """Check if the night should end due to deadline or budget."""
         if until_dt and now() >= until_dt - dt.timedelta(minutes=wrap_minutes):
@@ -1835,9 +1915,9 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             z = until_dt.strftime("%H:%M")
             msg = f"{title}'s night ends at {local} ({z}Z)"
             if everything:
-                b = board(est, repo)
+                b = board(est, repo, by)
                 remaining = b["ready"] + b["working"] + b["blocked"]
-                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}"
+                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}" + left_alone(b)
             print(f"curia: {msg}; not waking it again")
             log_session(sd, "deadline", f"until={until_dt.isoformat()} remaining={len(remaining) if everything else '?'}")
             notify(est, f"{title}: night ended at the deadline", msg)
@@ -1845,9 +1925,9 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if budget_float is not None and spent >= budget_float:
             msg = f"{title}'s night spent ${spent:.2f} of the ${budget_float:.2f} budget"
             if everything:
-                b = board(est, repo)
+                b = board(est, repo, by)
                 remaining = b["ready"] + b["working"] + b["blocked"]
-                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}"
+                msg += f"; {len(remaining)} ready, {len(b['working'])} in progress remain in {repo}" + left_alone(b)
             print(f"curia: {msg}; not waking it again")
             log_session(sd, "budget", f"spent={spent:.2f} budget={budget_float:.2f}")
             notify(est, f"{title}: night ended on budget", msg)
@@ -1871,9 +1951,10 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
         if check_night_over():
             break
         if everything:
-            b = board(est, repo)
+            b = board(est, repo, by)
             counts = board_counts(b)
-            log_session(sd, "board", f"repo={repo} {board_detail(counts)} fresh={'yes' if b.get('fresh', True) else 'no'}")
+            log_session(sd, "board", f"repo={repo} {board_detail(counts)} fresh={'yes' if b.get('fresh', True) else 'no'}"
+                                     + (f" by={by_field(by)}" if by else ""))
             if handed_off:
                 # The session before this reading handed off; the board as now pushed says what it did.
                 # A reading the fetch could not refresh is the old board again and moves nothing.
@@ -1886,10 +1967,10 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             remaining = b["ready"] + b["working"] + b["blocked"]
             if not remaining:
                 msg = (f"{title}'s board in {repo} is clear: nothing remains that is not waiting on a human "
-                       f"({len(b['human'])} waiting, {b['closed']} closed).")
+                       f"({len(b['human'])} waiting, {b['closed']} closed)." + left_alone(b))
                 print("curia: " + msg)
                 log_session(sd, "clear", f"repo={repo} human={len(b['human'])} closed={b['closed']}")
-                notify(est, f"{title}: board clear in {repo}", msg)
+                notify(est, f"{title}: board clear in {repo}" + (f" (beads by {', '.join(by)})" if by else ""), msg)
                 if next_board():
                     continue
                 break
@@ -1908,14 +1989,14 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                 msg = (f"{title} has woken twice in {repo} without the board moving ({len(remaining)} remaining, "
                        f"the same set, nothing closed; the board read from {b.get('source', '?')}); "
                        + ("moving on to the next board rather than spinning." if queue else
-                          "stopping so someone can look, rather than spinning."))
+                          "stopping so someone can look, rather than spinning.") + left_alone(b))
                 print("curia: " + msg, file=sys.stderr)
                 log_session(sd, "stalled", f"repo={repo} remaining={len(remaining)}")
                 notify(est, f"{title}: no progress in {repo}", msg)
                 if next_board():
                     continue
                 break
-            orders = everything_orders(repo, b, night_ord) + (f"\n\nAlso, from the principal: {say}" if say else "")
+            orders = everything_orders(repo, b, night_ord, by) + (f"\n\nAlso, from the principal: {say}" if say else "")
         free, limited = walk_chain(est, want, own)
         if free is None and loop and limited:
             until = min(u for _, u in limited)
@@ -5557,7 +5638,11 @@ def cmd_progress(a) -> None:
         repo, _ = est.repo(a.repo)
     elif sessions[-1]["cwd"]:
         repo = est.repo_at(Path(sessions[-1]["cwd"]))
-    b = board(est, repo) if repo else None
+    # A --by night's readings count only those beads, so the board now is read the same way.
+    on_record = [d for ev, _, d in session_events(sd) if ev == "board" and detail_field(d, "repo") == repo]
+    by = by_read(detail_field(on_record[-1], "by")) if on_record else None
+    scope = f"; beads by {', '.join(by)} only" if by else ""
+    b = board(est, repo, by) if repo else None
     live = board_counts(b) if b else None
     issues = b["issues"] if b else []
     # The launcher reads the board just before each waking, so the reading that opened the
@@ -5590,7 +5675,7 @@ def cmd_progress(a) -> None:
         rows.append({**x, "before": bf, "after": af, "said": principal_line(note) if note else "",
                      "ended": x["ended"] or f"awake {age(x['start'])}"})
     print(f"{title}, {est.name} estate: {len(sessions)} waking(s) {window}"
-          + (f"; the board of {repo}" if repo else "; no board (the sessions started outside any repo)"))
+          + (f"; the board of {repo}{scope}" if repo else "; no board (the sessions started outside any repo)"))
     print()
     print(f"  {'woke':<17} {'account':<9} {'min':>5} {'cost':>8}  {'workable':<12} {'human':>5}  {'ended':<10} for the principal")
     for r in rows:
@@ -5619,12 +5704,14 @@ def cmd_progress(a) -> None:
         who_s = ", ".join(f"{k} {v}" for k, v in sorted(who.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
         print(f"Board of {repo} now ({b['source']}): {live['ready']} ready, {live['working']} in progress, "
               f"{live['blocked']} blocked = {live['workable']} workable; the loop ends at 0. "
-              f"{live['human']} waiting on a person" + (f" ({who_s})" if who_s else "") + ".")
+              f"{live['human']} waiting on a person" + (f" ({who_s})" if who_s else "") + "."
+              + (f" {by_others(b)} not counted." if by else ""))
 
         def when(i: dict, key: str) -> dt.datetime | None:
             return parse_iso(str(i.get(key) or ""))
-        closed_since = sum(1 for i in issues if i.get("status") == "closed" and (when(i, "closed_at") or since) > since)
-        filed_since = sum(1 for i in issues if (when(i, "created_at") or since) > since)
+        counted = [i for i in issues if not by or filed_by(i, by)]
+        closed_since = sum(1 for i in counted if i.get("status") == "closed" and (when(i, "closed_at") or since) > since)
+        filed_since = sum(1 for i in counted if (when(i, "created_at") or since) > since)
         totals += f"; beads closed {closed_since}, filed {filed_since}"
     print(totals + ".")
     if readings:
@@ -5644,7 +5731,7 @@ def cmd_progress(a) -> None:
         points = []
     path = Path(a.html).expanduser() if a.html else est.dir / "brain" / "progress" / f"{name}.html"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(progress_page(title, est.name, repo, window, rows, points, totals, live, b["source"] if b else ""))
+    path.write_text(progress_page(title, est.name, repo, window + scope, rows, points, totals, live, b["source"] if b else ""))
     print(f"written {path}")
 
 
@@ -6136,7 +6223,7 @@ Looking around
   progress <seat>           a long run waking by waking: cost, how the board moved, the distance to done (--since, --repo, --html)
 
 Waking seats
-  launch <seat>             wake a crew seat or office, primed (--loop, --everything, --say, --repo, --account, --until, --budget)
+  launch <seat>             wake a crew seat or office, primed (--loop, --everything, --by, --say, --repo, --account, --until, --budget)
   prime <seat>              print the prime a seat would wake with (--for "text": with what it would recall)
   run <seat> --prompt <f>   headless run of a seat with a prompt file; how an office wakes a crew seat (--model, --detach, --print-cmd)
   dispatch <fleet>          a fleet worker gets a worktree of its own and a job there (--bead <id>, --review <seat>, --repo, --detach)
@@ -6678,6 +6765,25 @@ closed; a bead taken from ready to in progress is movement - so a stuck
 seat does not spin all night; the principal is told either way. --say is
 appended to the orders.
 
+--by, with --everything, narrows the night to the beads one person filed.
+A bead is theirs when its created_by (the name it was filed under) or its
+owner (the filer's email) is the whole value given, in any case; part of a
+name matches nothing. One person often files under several names, so it
+repeats, and a bead by any of them is in. Their beads are sorted against
+the whole board: a blocker someone else closed is no blocker, and a bead
+blocked only by someone else's open bead counts as waiting on a person.
+The orders name every id in scope, not the first dozen, and tell the seat
+to leave the rest alone. The loop's ends read those beads only, so another
+person's work on the board neither keeps the loop awake nor counts as
+movement. Every --by is read against the boards given before the first
+waking: one that matches no bead stops the launch and lists who has filed
+there, since a misspelt name would otherwise read as a clear board. The
+launch prints what each board comes to and who was left out; --print-cmd
+does the same without launching. It will NOT look at the assignee (a bead
+this person filed and someone else has claimed is still in scope), follow
+a dependency out of scope, or fence anything: the orders are what keep the
+seat off other people's beads, and `bd` still shows it the whole board.
+
 When a session ends on its handoff, the launcher prints the note back
 into the terminal - claude clears the screen on exit, and a launch that
 ended in silence left the principal with an empty terminal and a note to
@@ -7118,7 +7224,10 @@ launcher writes at each waking; before those exist they are rebuilt from
 the export's own timestamps (created, started, closed) with labels and
 dependencies as they stand now, and the output says which it did. A `?`
 on either side of a workable column is a side with no reading: a session
-still awake, or a night that ended before the board was read again.
+still awake, or a night that ended before the board was read again. After
+a `launch --everything --by` night the `board` lines carry the names, and
+the board now, the beads closed and the beads filed count only those
+people's beads; the view says so and says how many it left out.
 
 --html draws the same as one self-contained page: workable and
 human-waiting beads over time, the distance to done, and the wakings with
@@ -7221,7 +7330,10 @@ examples:
   curia launch <office> --repo <repo> --everything   work the board until nothing remains but what waits on a human
   curia launch <office> --everything --repo <repo> --repo <repo2>   ...several boards, in that order, one night
   curia launch <office> --repo <repo> --everything --until 06:30   ...the board, until 06:30 local time
-  curia launch <office> --repo <repo> --everything --budget 200   ...the board, until $200 of recorded spend""",
+  curia launch <office> --repo <repo> --everything --budget 200   ...the board, until $200 of recorded spend
+  curia launch <office> --repo <repo> --everything --by "<name>"   ...only the beads that person filed
+  curia launch <office> --repo <repo> --everything --by "<name>" --by <email>   ...filed under either
+  curia launch <office> --repo <repo> --everything --by "<name>" --print-cmd   ...see what that comes to, without launching""",
     "run": """\
 examples:
   curia run <seat> --prompt <name>.md --repo <repo>
@@ -7546,6 +7658,9 @@ def main() -> None:
                    help="work the repo's board, or each --repo's in turn, until nothing remains that is not "
                         "waiting on a human (implies --loop; records the board at each waking and tells the "
                         "principal at each handoff)")
+    p.add_argument("--by", action="append", metavar="WHO",
+                   help="with --everything, work only the beads this person filed: a whole created_by name or owner "
+                        "email, any case; repeatable, for someone who files under several")
     p.add_argument("--until", help="end the night at this time: HH:MM local, or ISO datetime (UTC assumed if naive); "
                    "requires --loop or --everything")
     p.add_argument("--budget", help="end the night when recorded spend reaches this USD amount; "

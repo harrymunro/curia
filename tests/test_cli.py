@@ -1593,6 +1593,177 @@ def test_everything_works_several_boards_in_the_order_given(curia, cli, estate, 
     assert rc == 2 and "only --everything takes several" in err and not wakings
 
 
+def by_bead(i, who="Ann Filer", owner="ann@example.test", status="open", blocks=(), labels=()):
+    return {"id": i, "status": status, "title": i, "labels": list(labels), "created_by": who, "owner": owner,
+            "dependencies": [{"type": "blocks", "depends_on_id": b} for b in blocks]}
+
+
+def bo_bead(i, status="open", **kw):
+    return by_bead(i, who="Bo Other", owner="bo@example.test", status=status, **kw)
+
+
+def write_board(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_by_sorts_one_persons_beads_against_the_whole_board(curia, estate):
+    rows = [by_bead("an-1"),
+            by_bead("an-2", blocks=("bo-1",)),            # someone else closed its blocker: ready
+            by_bead("an-3", blocks=("bo-2",)),            # someone else has its blocker open: waits on a person
+            by_bead("an-4", blocks=("an-3",)),            # blocked only by what waits on a person
+            by_bead("an-5", blocks=("an-1", "bo-2")),     # one blocker still its own: comes through
+            by_bead("an-6", status="in_progress"),
+            by_bead("an-7", status="closed"),
+            by_bead("an-8", labels=("needs-principal",)),
+            bo_bead("bo-1", status="closed"),
+            bo_bead("bo-2"),
+            bo_bead("bo-3", status="in_progress")]
+    ids = lambda xs: sorted(i["id"] for i in xs)   # noqa: E731
+    b = curia.sort_board(estate, rows, ["Ann Filer"])
+    assert ids(b["ready"]) == ["an-1", "an-2"] and ids(b["working"]) == ["an-6"] and ids(b["blocked"]) == ["an-5"]
+    assert ids(b["human"]) == ["an-3", "an-4", "an-8"] and b["closed"] == 1
+    assert ids(b["others"]) == ["bo-2", "bo-3"]
+    assert curia.board_counts(b)["workable"] == 4
+    # the email finds the same beads, in any case; so does the name in any case; part of either finds none
+    assert ids(curia.sort_board(estate, rows, ["ANN@example.test"])["ready"]) == ["an-1", "an-2"]
+    assert ids(curia.sort_board(estate, rows, ["ann filer"])["ready"]) == ["an-1", "an-2"]
+    none = curia.sort_board(estate, rows, ["Ann"])
+    assert not (none["ready"] or none["working"] or none["blocked"] or none["human"] or none["closed"])
+    # several names are one scope: a blocker by either is its own
+    both = curia.sort_board(estate, rows, ["Ann Filer", "bo@example.test"])
+    assert not both["others"] and both["closed"] == 2 and "an-3" in ids(both["blocked"])
+    # no by is the whole board, as it always was
+    plain = curia.sort_board(estate, rows)
+    assert plain["others"] == [] and plain["closed"] == 2
+    assert ids(plain["ready"]) == ["an-1", "an-2", "bo-2"] and "an-3" in ids(plain["blocked"])
+
+
+def test_everything_by_works_one_persons_beads_and_leaves_the_rest(curia, cli, estate, monkeypatch, tmp_path):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    mine = {f"an-{n}": by_bead(f"an-{n}") for n in range(1, 15)}   # more than the dozen plain orders would name
+    rows = {**mine, "bo-1": bo_bead("bo-1"), "bo-2": bo_bead("bo-2", status="in_progress")}
+    write_board(export, rows.values())
+    told = tmp_path / "told.txt"
+    meta = (estate.dir / "estate.toml").read_text().replace(
+        'notify = ""', f'notify = \'printf "%s\\n" "$CURIA_SUBJECT" >> {told}\'')
+    (estate.dir / "estate.toml").write_text(meta)
+    orders = []
+
+    def fake(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        orders.append(cmd[-1])
+        for k in mine:
+            rows[k]["status"] = "closed"
+        write_board(export, rows.values())
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", fake)
+    rc, out, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything", "--by", "Ann Filer")
+    assert rc == 0, err
+    assert len(orders) == 1   # clear on that person's beads, with someone else's still open
+    assert all(k in orders[0] for k in mine) and " ..." not in orders[0]
+    assert "only beads filed by Ann Filer" in orders[0] and "2 open by others (Bo Other 2)" in orders[0]
+    assert "do not claim, work, dispatch, close or change them" in orders[0]
+    assert "bo-1" not in orders[0] and "bo-2" not in orders[0]
+    assert "alpha, beads by Ann Filer only: 14 workable" in out and "2 open by others (Bo Other 2) left alone" in out
+    assert "Beads by Ann Filer only; 2 open by others (Bo Other 2) left alone." in out
+    assert told.read_text().splitlines()[-1] == "Warden: board clear in alpha (beads by Ann Filer)"
+    lines = [d for e, _, d in curia.session_events(estate.seat_dir("warden")) if e == "board"]
+    assert curia.counts_from_detail(lines[0])["ready"] == 14 and curia.counts_from_detail(lines[-1])["closed"] == 14
+    assert curia.by_read(curia.detail_field(lines[0], "by")) == ["Ann Filer"]
+    # someone else's beads moving is not this night moving: it stops as stuck, and says who it left alone
+    rows["an-20"] = by_bead("an-20")
+    write_board(export, rows.values())
+    n = {"wakings": 0}
+
+    def others_only(cmd, cwd, env, timeout=None, capture=False, watch=None):
+        n["wakings"] += 1
+        rows["bo-1"]["updated_at"] = f"2026-06-0{n['wakings']}T00:00:00Z"
+        rows[f"bo-1{n['wakings']}"] = bo_bead(f"bo-1{n['wakings']}", status="closed")
+        write_board(export, rows.values())
+        (estate.seat_dir("warden") / "RESTART").touch()
+        return 0
+
+    monkeypatch.setattr(curia, "invoke_claude", others_only)
+    rc, _, err = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything", "--by", "ann@example.test")
+    assert rc == 0 and n["wakings"] == 2 and "without the board moving" in err and "left alone" in err
+
+
+def test_by_is_checked_against_the_boards_before_the_first_waking(curia, cli, estate, monkeypatch):
+    write_board(estate.root / "alpha" / ".beads" / "issues.jsonl", [by_bead("an-1"), bo_bead("bo-1")])
+    write_board(estate.repo_path("nested") / ".beads" / "issues.jsonl", [bo_bead("su-1")])
+    woke = []
+    monkeypatch.setattr(curia, "invoke_claude", lambda *a, **k: woke.append(a) or 0)
+    base = (*E(estate), "launch", "warden", "--repo", "alpha")
+    # it narrows a board, so it wants one
+    rc, _, err = cli(*base, "--by", "Ann Filer")
+    assert rc == 2 and "add --everything" in err
+    # nobody by that name, and part of a name is nobody: stop, and say who has filed
+    rc, _, err = cli(*base, "--everything", "--by", "Ann")
+    assert rc == 2 and "filed by Ann." in err and "Ann Filer <ann@example.test> 1" in err and "Bo Other <bo@example.test> 1" in err
+    # one good name does not carry a misspelt one
+    rc, _, err = cli(*base, "--everything", "--by", "Ann Filer", "--by", "ann@exmaple.test")
+    assert rc == 2 and "filed by ann@exmaple.test." in err
+    # an empty name would otherwise match a bead with no creator on record
+    rc, _, err = cli(*base, "--everything", "--by", "  ")
+    assert rc == 2 and "empty" in err
+    assert not woke
+    # --print-cmd says what it comes to and wakes nothing
+    rc, out, err = cli(*base, "--everything", "--by", "Ann Filer", "--print-cmd")
+    assert rc == 0, err
+    assert "alpha, beads by Ann Filer only: 1 workable, 0 waiting on a person, 0 closed; 1 open by others" in out
+    assert not woke and not (estate.seat_dir("warden") / "sessions.log").exists()
+    # a person who filed nothing on one of several boards is not a slip: that board is simply clear for them
+    rc, out, err = cli(*E(estate), "launch", "warden", "--everything", "--repo", "nested", "--repo", "alpha",
+                       "--by", "Ann Filer", "--print-cmd")
+    assert rc == 0, err
+    assert "nested, beads by Ann Filer only: 0 workable" in out and "alpha, beads by Ann Filer only: 1 workable" in out
+
+
+def test_everything_without_by_gives_the_orders_it_always_gave(curia, cli, estate, monkeypatch):
+    export = estate.root / "alpha" / ".beads" / "issues.jsonl"
+    rows = [by_bead(f"an-{n:02}") for n in range(1, 15)] + [bo_bead("bo-1", blocks=("an-01",))]
+    write_board(export, rows)
+    b = curia.board(estate, "alpha")
+    orders = curia.everything_orders("alpha", b)
+    assert "scope" not in orders and "an-12 ..." in orders and "an-13" not in orders
+    assert "15 ready" not in orders and "14 ready" in orders and "1 blocked by other beads on the board, 0 waiting" in orders
+    woke = []
+    monkeypatch.setattr(curia, "invoke_claude", lambda *a, **k: woke.append(a) or 1)
+    rc, out, _ = cli(*E(estate), "launch", "warden", "--repo", "alpha", "--everything")
+    assert rc == 0 and woke and "beads by" not in out
+    line = next(d for e, _, d in curia.session_events(estate.seat_dir("warden")) if e == "board")
+    assert "by=" not in line
+
+
+def test_progress_reads_a_by_night_the_way_it_ran(curia, cli, estate, monkeypatch, tmp_path):
+    def stamped(bead, created, closed=None):
+        return {**bead, "created_at": created, "closed_at": closed}
+
+    rows = [stamped(by_bead("an-1", status="closed"), "2026-06-01T00:00:00Z", "2026-06-01T13:00:00Z"),
+            stamped(by_bead("an-2"), "2026-06-01T14:00:00Z"),
+            stamped(bo_bead("bo-1", status="closed"), "2026-06-01T14:00:00Z", "2026-06-01T14:30:00Z"),
+            stamped(bo_bead("bo-2"), "2026-06-01T00:00:00Z")]
+    write_board(estate.root / "alpha" / ".beads" / "issues.jsonl", rows)
+    sd = estate.seat_dir("warden")
+    sd.mkdir(exist_ok=True)
+    by = curia.by_field(["Ann Filer"])
+    assert " " not in by and curia.by_read(by) == ["Ann Filer"] and curia.by_read("") is None
+    (sd / "sessions.log").write_text(
+        f"board 2026-06-01T11:59:00+00:00 repo=alpha ready=1 working=0 blocked=0 human=0 closed=0 fresh=yes by={by}\n"
+        f"start 2026-06-01T12:00:00+00:00 account=a model=m cwd={estate.repo_path('alpha')} session=s1 pid=77\n"
+        "end 2026-06-01T15:00:10+00:00 rc=0 session=s1 cost=$3.00 minutes=180.0 handed-off\n"
+        f"board 2026-06-01T15:00:20+00:00 repo=alpha ready=1 working=0 blocked=0 human=0 closed=1 fresh=yes by={by}\n")
+    monkeypatch.setattr(curia, "now", lambda: dt.datetime(2026, 6, 2, 12, 0, tzinfo=UTC))
+    page = tmp_path / "night.html"
+    rc, out, err = cli(*E(estate), "progress", "warden", "--html", str(page))
+    assert rc == 0, err
+    assert "the board of alpha; beads by Ann Filer only" in out
+    assert "1 ready, 0 in progress, 0 blocked = 1 workable" in out and "1 open by others (Bo Other 1) not counted." in out
+    assert "beads closed 1, filed 1." in out   # that person's, not the ones someone else closed and filed
+    assert "beads by Ann Filer only" in page.read_text()
+
+
 def test_run_falls_back_by_model_before_it_falls_back_by_account(curia, cli, estate, monkeypatch, tmp_path):
     roster = (estate.dir / "roster.toml").read_text().replace(
         'run_model = "model-y"\n', 'run_model = "model-y"\nfallback_model = "model-z"\n')

@@ -128,6 +128,7 @@ curia launch <office> --repo <repo> --everything   # work the board in a loop un
 curia launch <office> --everything --repo <repo> --repo <repo2>   # ...several boards, in that order, one night
 curia launch <office> --repo <repo> --everything --until 06:30   # ...the board, until 06:30 local time
 curia launch <office> --repo <repo> --everything --budget 200    # ...the board, until $200 of recorded spend
+curia launch <office> --repo <repo> --everything --by "<name>"   # ...only the beads that person filed; repeat --by for each name they file under
 curia ingest <notes...>          # capture beads from meeting notes (wakes the intake office)
 curia ingest --paste             # ...from the clipboard; `... ingest -` reads stdin
 curia ingest --paste --repo <repo>   # ...when the notes concern one repo: start and file there
