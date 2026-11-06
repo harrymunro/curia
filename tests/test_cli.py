@@ -557,10 +557,10 @@ def test_no_listing_in_the_estate_leaves_the_settings_as_they_were(curia, cli, e
     install_skill(tmp_path / "acct-a", "scrape-web")
     seen = record_claude(curia, monkeypatch)
     assert cli(*E(estate), "launch", "muse")[0] == 0
-    assert set(settings_of(seen["cmd"])) == {"hooks", "statusLine"}
+    assert set(settings_of(seen["cmd"])) == {"hooks", "statusLine", "autoMode"}
     (estate.dir / "prompts" / "b.md").write_text("do\n")
     assert cli(*E(estate), "run", "muse", "--prompt", "b.md")[0] == 0
-    assert set(settings_of(seen["cmd"])) == {"hooks"}
+    assert set(settings_of(seen["cmd"])) == {"hooks", "autoMode"}
     rc, out, _ = cli(*E(estate), "launch", "muse", "--print-cmd")
     assert rc == 0 and "; skills" not in out and "; plugins" not in out
 
@@ -708,14 +708,15 @@ def test_precompact_hook_refuses_manual_compaction_unless_allowed(cli, estate, m
     rc, _, _ = cli("hook", "precompact", stdin='{"trigger": "manual"}')
     assert rc == 0
     rc, _, err = cli("hook", "nonsense")
-    assert rc == 2 and "no hook" in err
+    assert rc == 1 and "no hook" in err   # not 2: exit 2 from a hook refuses the tool
 
 
 # -------------------------------------------------------------------- help
 
 def test_help_covers_every_command(curia, cli):
     rc, _, err = cli("no-such-command")
-    names = re.findall(r"'([a-z]+)'", err.split("choose from", 1)[1])
+    # Newer Pythons print the choices bare, older ones quoted; either way they are the lowercase words.
+    names = re.findall(r"[a-z][a-z-]*", err.split("choose from", 1)[1])
     assert len(names) >= 15
     for name in names:
         assert name in curia.HELP_DETAIL, f"no `curia help {name}` page"
@@ -808,7 +809,7 @@ def test_launch_and_run_carry_the_envelope_and_the_estate_fences(curia, cli, est
     assert rc == 0, err
     cmd = seen["cmd"]
     settings = json.loads(cmd[cmd.index("--settings") + 1])
-    assert "PreCompact" in settings["hooks"] and settings["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
+    assert "PreCompact" in settings["hooks"] and "Bash" in [e.get("matcher") for e in settings["hooks"]["PreToolUse"]]
     assert cmd[cmd.index("--allowedTools") + 1] == "Bash,Read"
     assert cmd[cmd.index("--disallowedTools") + 1] == "WebFetch"
     start = curia.session_events(estate.seat_dir("warden"))[0][2]
@@ -997,14 +998,14 @@ def test_dispatch_gives_a_worker_a_home_and_reap_takes_it_back_once_landed(curia
     assert "implement bead al-1 in alpha" in prompt and f"`{wt}`" in prompt
     assert "on branch `worker/al-1` off `main`" in prompt and "just test" in prompt
     rcmd, rcwd, renv = seen[1]
-    assert rcwd == wt and renv["CURIA_SEAT"] == "muse"
+    assert rcwd == estate.root / "worktrees" / "muse" / "alpha-review" and renv["CURIA_SEAT"] == "muse"
     rprompt = rcmd[rcmd.index("-p") + 1]
     assert "reviewing bead al-1 as implemented by Worker" in rprompt and "--add-label reviewed" in rprompt
     assert "Never file a new bead" in rprompt   # the default brief keeps a worked board convergent
     assert "--- review by Muse ---" in out and "implemented" in out
     assert branch_of(wt) == "worker/al-1"
     log = (estate.seat_dir("worker") / "assignments.log").read_text()
-    assert [line.split()[0] for line in log.splitlines()] == ["dispatch", "returned", "reviewed"]
+    assert [line.split()[0] for line in log.splitlines()] == ["dispatch", "returned", "reviewing", "reviewed"]
     assert "bead=al-1 repo=alpha branch=worker/al-1" in log and "by=Muse" in log
     # a second job reuses the home on a new branch; a dirty home is refused
     rc, _, err = cli(*E(estate), "dispatch", "worker", "--bead", "al-2", "--repo", "alpha")
@@ -2571,10 +2572,10 @@ def test_check_notes_a_prime_over_the_size_it_is_given(curia, cli, estate):
     sd = estate.seat_dir("muse")
     (sd / "charter.md").write_text("# Charter\n" + ("law " * 9000))   # about 35 KB
     rc, out, _ = cli(*E(estate), "check")
-    assert "seat muse: wakes with a" in out and "KB prime" in out and "charter 35 KB" in out
+    assert "1 active seat(s) wake with a prime over prime_max_kb" in out and "heaviest muse" in out and "Your charter 35 KB" in out
     (estate.dir / "estate.toml").write_text((estate.dir / "estate.toml").read_text() + "\nprime_max_kb = 64\n")
     rc, out, _ = cli(*E(estate), "check")
-    assert "KB prime" not in out
+    assert "over prime_max_kb" not in out
 
 
 def test_gh_json_says_why_it_answered_nothing(curia, monkeypatch):
@@ -2723,7 +2724,7 @@ def test_prime_states_the_authority_the_fences_and_the_law(curia, cli, estate):
     assert "release-guard (PreToolUse on Bash)" in auth and "record-guard (PreToolUse on Edit|Write)" in auth
     assert "/usr/local/bin/no-secrets.sh (PreToolUse)" in auth
     assert "  - 2026-01-01-no-force-push: enacted\n" in auth
-    assert "  - 2026-01-02-tests-first: enforced, enforced by a test" in auth
+    assert "  - 2026-01-02-tests-first: enforced\n" in auth + "\n"
     assert "2026-01-03-old" not in auth
     assert "Effort: low" in prime
     # interactively a seat with no list has the account's permissions; headless, the default list
@@ -2737,7 +2738,7 @@ def test_prime_states_the_authority_the_fences_and_the_law(curia, cli, estate):
         f.unlink()
     rc, out, _ = cli(*E(estate), "prime", "warden")
     assert rc == 0 and "## Your authority" in out and "Rulings in force: none yet" in out
-    assert "Fences (programs that refuse, in every seat session): and the mechanism's own" in out
+    assert "Fences (programs that refuse, in every seat session): the mechanism's own" in out
 
 
 def test_effort_rides_the_envelope_and_check_faults_a_bad_one(curia, cli, estate, monkeypatch):

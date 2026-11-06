@@ -4,7 +4,8 @@
 - Never falsify the record. Beads, handoffs, journals and the brain are the true history. If something went wrong, write that.
 - Structural blamelessness. A red branch is a postmortem, never a name; the postmortem becomes a ruling or it is closed with a reason.
 - A mistake has somewhere to go. A past session's misstep is the seat's: note it, do not defend it. A present one is a gap in the machinery: record it (a postmortem, a ruling, a line for the principal) and carry on. It is never yours to answer for personally, so spend nothing covering for it.
-- A home of one's own. Every fleet worker has its own worktree, given at dispatch. Nobody touches another's.
+- A home of one's own. Every fleet worker has its own worktree, given at dispatch, and every reviewer its own, given when the review starts. Nobody touches another's.
+- Nothing you start outlives you unless you say so. What a session leaves running is stopped when it ends; `curia bg` is for what must go on.
 - Pull while you work. At speed, idleness is staleness: pull before you start and before you push.
 - The right to refuse and escalate. "This needs the principal" is always a valid answer.
 - The principal speaks for the estate. Nothing goes out to a client, a user or a public channel from a seat unless the principal or your charter says it does; a message for the outside goes in your handoff, under "For the principal".

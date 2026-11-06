@@ -18,9 +18,11 @@ Vocabulary
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import dataclasses
 import datetime as dt
+import fcntl
 import fnmatch
 import hashlib
 import html
@@ -106,15 +108,31 @@ WATCH_SECONDS = 5
 # context_at: the Stop hook tells a seat to hand off once its context window is
 # this full (percent, as the status line measures it; 0: never): a long context
 # costs more every turn, and a note written early is a note written well.
+# context_tokens_at: the same in tokens (0: never), because a percentage of a very
+# large window is a very expensive context. shift_remind_minutes: how often a seat
+# past its shift hears it again inside one long turn (0: once). ask_notify_minutes:
+# how long a question to the principal may stand before the principal is told
+# (0: at once). tell_per_hour: how many notices `tell` lets a seat send in an hour.
+# bg_hours: how long `bg` lets a job run. settle_minutes: how long a `--everything`
+# launcher waits, spending nothing, on the integration run of what it landed (0:
+# not at all). floor_disk_gb, floor_swap_gb: `dispatch`, `run` and `bg` refuse below
+# that much free disk or above that much swap in use (0: no such floor).
 # fences_max: `check` notes an estate declaring more fences than this in
 # hooks.json; fences are distrust written down, and past a point no work is legal.
 THRESHOLDS = {"rotate_at": 70.0, "rotate_week_at": 90.0, "handoff_at": 85.0, "limited_at": 95.0,
               "shift_hours": 6.0, "wrap_minutes": 45.0, "budget_wrap_at": 90.0, "reap_quiet_hours": 1.0,
-              "prime_max_kb": 32.0, "context_at": 60.0, "fences_max": 20.0,
+              "prime_max_kb": 32.0, "context_at": 60.0, "context_tokens_at": 400000.0, "fences_max": 20.0,
+              "shift_remind_minutes": 30.0, "ask_notify_minutes": 5.0, "tell_per_hour": 6.0, "bg_hours": 6.0,
+              "settle_minutes": 90.0, "floor_disk_gb": 5.0, "floor_swap_gb": 0.0,
               # Where a judgment (`jev`) becomes a line in a report. A noul is 0 to 1; a score
               # over three levels is 0 to 2. recall and same are scores, the rest nouls.
               "jev_recall_at": 1.2, "jev_same_at": 1.2, "jev_route_at": 0.6, "jev_needs_at": 0.7,
               "jev_screen_at": 0.3, "jev_durable_at": 0.6}
+# What the auto-mode classifier refuses however a charter reads, so the prime can say so
+# and a seat need not find out by trying; estate.toml `refused_classes` replaces the list.
+AUTO_MODE_REFUSES = ("reading production systems or their secrets", "starting a deploy or a production workflow",
+                     "stopping another session's processes by hand (`curia stop` is the way)",
+                     "sweeping shared scratch space by pattern")
 # Effort levels Claude Code takes (--effort); a roster `effort` must be one.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # The record a seat session may not edit through Edit or Write: paths under the
@@ -695,7 +713,72 @@ def seconded_model(body: str) -> str:
 
 def build_prime(est: Estate, seat: str, journal_path: Path | None = None, model: str | None = None,
                 seconded: str | None = None, recalled: list[dict] | None = None) -> str:
-    """The system prompt a seat wakes with. journal_path marks a headless
+    """The system prompt a seat wakes with, as prime_parts says."""
+    return "\n\n".join(prime_parts(est, seat, journal_path, model, seconded, recalled)) + "\n"
+
+
+def prime_part_name(part: str) -> str:
+    """A prime part's heading, short; the parts before the first heading are the head."""
+    first = part.split("\n", 1)[0]
+    return re.split(r"[(:]", first[3:], maxsplit=1)[0].strip() if first.startswith("## ") else "head"
+
+
+def fleet_section(est: Estate, name: str) -> str:
+    """## Fleet, for a seat that manages one: what each worker is doing, and what the
+    machine can still hold. Mechanical, from the record, so a waking does not spend its
+    first ten minutes asking; empty for a seat with no fleet and no job running."""
+    lines = []
+    for k in fleet_of(est, name):
+        if not est.roster[k].get("active", True):
+            continue
+        sd = est.seat_dir(k)
+        title = est.roster[k].get("title", k)
+        live = [o for o in open_sessions(sd) if launcher_alive(o)]
+        dispatched = reviewing = returned = reviewed = None
+        for line in read(sd / "assignments.log").splitlines():
+            bits = line.split(" ", 2)
+            if len(bits) < 3:
+                continue
+            bead = detail_field(bits[2], "bead")
+            if bits[0] == "dispatch":
+                dispatched = (bead, bits[1], detail_field(bits[2], "review"))
+            elif bits[0] == "returned":
+                returned = (bead, bits[1], detail_field(bits[2], "rc"))
+            elif bits[0] == "reviewing":
+                reviewing = (bead, bits[1], detail_field(bits[2], "by"))
+            elif bits[0] == "reviewed":
+                reviewed = (bead, bits[1], detail_field(bits[2], "by"))
+        if not dispatched:
+            lines.append(f"- {title}: no job on record")
+            continue
+        bead, at, _ = dispatched
+        done = returned and returned[0] == bead and returned[1] >= at
+        if live:
+            state = f"building {bead}, {age(live[-1]['at'])}"
+        elif not done:
+            state = f"{bead} dispatched {age(at)} ago, no live session and no return on record"
+        else:
+            state = f"free; {bead} returned rc={returned[2]} {age(returned[1])} ago"
+        if reviewing and not (reviewed and reviewed[0] == reviewing[0] and reviewed[1] >= reviewing[1]):
+            state += f"; {reviewing[0]} under review by {reviewing[2]}, {age(reviewing[1])}"
+        lines.append(f"- {title}: {state}")
+    jobs = open_bg(est.seat_dir(name))
+    lines += [f"- Your background job {j['label']}: running {age(j['at'])}, log {j['log']}" for j in jobs]
+    if fleet_of(est, name):
+        m = machine_reading(est.dir)
+        bits = []
+        if m["disk_free_gb"] is not None:
+            bits.append(f"{m['disk_free_gb']:.0f} GB free on disk")
+        if m["swap_used_gb"] is not None:
+            bits.append(f"{m['swap_used_gb']:.0f} GB of swap in use")
+        if bits:
+            lines.append("- The machine: " + ", ".join(bits) + ".")
+    return "## Fleet (from the record, as you woke)\n" + "\n".join(lines) if lines else ""
+
+
+def prime_parts(est: Estate, seat: str, journal_path: Path | None = None, model: str | None = None,
+                seconded: str | None = None, recalled: list[dict] | None = None) -> list[str]:
+    """The prime, part by part. journal_path marks a headless
     waking: the closing line then points at the journal instead of /handoff,
     and model is the one actually in use for the run. seconded names the
     seat's usual model when this waking is on another: a limit or an order
@@ -744,6 +827,9 @@ def build_prime(est: Estate, seat: str, journal_path: Path | None = None, model:
                      "what this waking is for (0 to 2; it reads, it does not write). A line here is a pointer: "
                      "read the file if you need what it says.\n" +
                      "\n".join(f"- `{h['path']}` ({h['score']:.1f}): {h['first']}" for h in recalled))
+    fleet = fleet_section(est, name)
+    if fleet:
+        parts.append(fleet)
     laurels = read(sd / "laurels.md").strip()
     if laurels and not laurels.startswith("_"):
         parts.append("## Laurels\n" + laurels)
@@ -773,17 +859,25 @@ def build_prime(est: Estate, seat: str, journal_path: Path | None = None, model:
         auth.append("- Allowed without asking: whatever the account's own permissions say; the roster names no list.")
     if s.get("disallowed_tools"):
         auth.append("- Refused in every session: " + ", ".join(s["disallowed_tools"]) + ".")
+    refused = est.meta.get("refused_classes")
+    refused = [str(x) for x in refused] if isinstance(refused, list) else list(AUTO_MODE_REFUSES)
+    if refused:
+        auth.append("- Refused by the harness's permission classifier in auto mode, whatever a charter says: "
+                    + "; ".join(refused) + ".")
     fences = fence_names(est)
     auth.append("- Fences (programs that refuse, in every seat session): "
-                + ("; ".join(f"{n} ({ev})" for n, ev in fences) + "; " if fences else "")
-                + "and the mechanism's own: a manual /compact is refused (hand off instead), and the Stop hook "
-                "says when the shift is over. A refusal is a fence working, not a fault; if the work needs "
-                "what it refuses, say so for the principal.")
+                + ("; ".join(f"{n} ({ev})" for n, ev in fences) + ". The mechanism's own: " if fences else "the mechanism's own: ")
+                + "a manual /compact is refused (hand off instead), and new jobs are refused past the machine's "
+                "floor. A refusal is a fence working, not a fault; if the work needs what it refuses, say so for "
+                "the principal. The shift hooks say when a shift is over, at the end of a turn and inside a long one.")
+    auth.append("- Yours to use: `curia watch` under your Monitor tool to wait on the record, then end your turn; "
+                "`curia bg` for a command that must outlive this session; `curia tell` to reach the principal now; "
+                "`curia stop` for a run that should end; `curia waiting <repo>` for who the board waits on.")
     live = [r for r in rulings(est) if r["status"] != "retired"]
     if live:
-        auth.append("- Rulings in force (`curia rulings`; the file under brain/rulings/ has the reasoning):\n"
-                    + "\n".join(f"  - {r['slug']}: {r['status'] or 'no status'}"
-                                + (f", enforced by {r['enforced']}" if r["enforced"] else "") for r in live))
+        auth.append("- Rulings in force (`curia rulings` says what enforces each; the file under brain/rulings/ has "
+                    "the reasoning):\n"
+                    + "\n".join(f"  - {r['slug']}: {r['status'] or 'no status'}" for r in live))
     else:
         auth.append("- Rulings in force: none yet in brain/rulings/.")
     parts.append("\n".join(auth))
@@ -793,7 +887,7 @@ def build_prime(est: Estate, seat: str, journal_path: Path | None = None, model:
                      f"`{journal_path}` is your memory; the orders at the end of your prompt say what goes in it.")
     else:
         parts.append(where + "When the session should end, use /handoff, not /exit.")
-    return "\n\n".join(parts) + "\n"
+    return parts
 
 
 def log_session(sd: Path, event: str, detail: str = "") -> None:
@@ -1073,6 +1167,7 @@ def cmd_check(a) -> None:
     est = find_estate(a.estate)
     problems: list[str] = []
     notes: list[str] = []
+    heavy: list[tuple[int, str]] = []
     for k, v in est.roster.items():
         if v.get("account") not in est.accounts:
             problems.append(f"seat {k}: account '{v.get('account')}' not in accounts.toml")
@@ -1094,15 +1189,10 @@ def cmd_check(a) -> None:
         problems += listing_faults(f"seat {k}", v.get("skills"), v.get("plugins"))
         if not v.get("active", True):
             notes.append(f"seat {k}: parked (active = false); nothing wakes it and its memory stays")
-        size = len(build_prime(est, k).encode())
-        if size > est.threshold("prime_max_kb") * 1024:
-            parts = {"charter": sd / "charter.md", "handoff": sd / "handoff.md", "laurels": sd / "laurels.md",
-                     "mail": sd / "mail.md", "house rules": est.dir / "house-rules.md"}
-            bulk = ", ".join(f"{n} {p.stat().st_size // 1024} KB" for n, p in parts.items()
-                             if p.exists() and p.stat().st_size >= 1024)
-            notes.append(f"seat {k}: wakes with a {size // 1024} KB prime, over prime_max_kb "
-                         f"({est.threshold('prime_max_kb'):g}); the bulk: {bulk or 'the tables'}. Standing text "
-                         "the seat can read on demand is cheaper in a file than read at every waking")
+        if v.get("active", True):
+            size = len(build_prime(est, k).encode())
+            if size > est.threshold("prime_max_kb") * 1024:
+                heavy.append((size, k))
         events = session_events(sd)
         starts = [e for e in events if e[0] == "start"]
         ends = [e for e in events if e[0] == "end"]
@@ -1135,6 +1225,20 @@ def cmd_check(a) -> None:
             if o["pid"] and not launcher_alive(o):
                 notes.append(f"seat {k}: a session from {age(o['at'])} ago has no end and its launcher "
                              f"(pid {o['pid']}) is gone; `curia reap` closes the record")
+    if heavy:
+        size, k = max(heavy)
+        parts = sorted(prime_parts(est, k), key=lambda x: -len(x.encode()))[:3]
+        bulk = ", ".join(f"{prime_part_name(x)} {len(x.encode()) // 1024} KB" for x in parts)
+        notes.append(f"{len(heavy)} active seat(s) wake with a prime over prime_max_kb ({est.threshold('prime_max_kb'):g}); "
+                     f"heaviest {k}, {size // 1024} KB: {bulk}. Standing text a seat can read on demand is cheaper in a "
+                     "file than read at every waking; `curia weight <seat>` shows the rest of what a waking carries")
+    breaches = floor_breaches(est)
+    if breaches:
+        notes.append("the machine is past its floor, so new jobs are refused: " + "; ".join(breaches))
+    absent = [k for k, path_ in registered_estates().items() if not (path_ / "estate.toml").exists()]
+    if absent:   # counted, never named: this report is read by seats of another client
+        notes.append(f"{len(absent)} estate(s) in {ESTATES_FILE} are absent from this machine: the mechanism's fence "
+                     "cannot screen their words here")
     for key in THRESHOLDS:
         v = est.meta.get(key)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
@@ -1280,7 +1384,7 @@ def estate_hooks(est: Estate) -> dict:
 
 def hooks_summary(est: Estate, headless: bool = False) -> str:
     n = sum(len(v) for v in estate_hooks(est).values())
-    return ("precompact, shift and limited hooks" + ("" if headless else ", usage status line")
+    return ("precompact, shift and limited hooks" + ("" if headless else ", mid-turn shift, question watch, usage status line")
             + (f" + {n} estate hook(s) from hooks.json" if n else ""))
 
 
@@ -1391,11 +1495,17 @@ def seat_settings(est: Estate | None = None, headless: bool = False, seat: str |
     settings.json is edited. The mechanism's hooks: PreCompact turns a manual
     /compact into a reminder to hand off; Stop says when the shift is over;
     StopFailure on a limit or a spent budget marks the account and tells the launcher.
-    Then whatever fences the estate declares in hooks.json. Interactively, a
-    status line that records what Claude Code measures. Where the estate sets
-    one, the skill listing for the seat on the account it resolved to
-    (skill_listing). Auto-compaction is not blocked, and nothing fires on a
-    context threshold; no such hook exists."""
+    Interactively, Stop only fires when a turn ends and one turn can run for hours,
+    so PostToolUse asks the same question inside the turn, and a question to the
+    principal is watched from PreToolUse to its answer. Then whatever fences the
+    estate declares in hooks.json. Interactively, a status line that records what
+    Claude Code measures. Where the estate sets one, the skill listing for the seat
+    on the account it resolved to (skill_listing). `connectors = false`, for the
+    estate or one seat in the roster, turns off the account's claude.ai connectors,
+    which a waking otherwise lists whether or not the seat ever calls one. The
+    seat's identity goes to the auto-mode classifier as `environment` context (never
+    an allow rule). Auto-compaction is not blocked, and nothing fires on a context
+    threshold; no such hook exists."""
     me = shlex.quote(str(Path(__file__).resolve()))
     hooks: dict = {
         "PreCompact": [{"matcher": "manual", "hooks": [{"type": "command", "command": f"{me} hook precompact"}]}],
@@ -1403,6 +1513,12 @@ def seat_settings(est: Estate | None = None, headless: bool = False, seat: str |
         "StopFailure": [{"matcher": "|".join(LIMIT_ERRORS),
                          "hooks": [{"type": "command", "command": f"{me} hook limited"}]}],
     }
+    if not headless:
+        answered = {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": f"{me} hook answered"}]}
+        hooks["PreToolUse"] = [{"matcher": "AskUserQuestion",
+                                "hooks": [{"type": "command", "command": f"{me} hook asked"}]}]
+        hooks["PostToolUse"] = [{"hooks": [{"type": "command", "command": f"{me} hook tool-shift"}]}, answered]
+        hooks["PostToolUseFailure"] = [answered]
     for event, entries in (estate_hooks(est) if est else {}).items():
         hooks.setdefault(event, []).extend(entries)
     settings: dict = {"hooks": hooks}
@@ -1414,7 +1530,37 @@ def seat_settings(est: Estate | None = None, headless: bool = False, seat: str |
             settings["skillOverrides"] = skills
         if plugins:
             settings["enabledPlugins"] = plugins
+    connectors = est.meta.get("connectors") if est else None
+    if est and seat:
+        connectors = est.seat(seat)[1].get("connectors", connectors)
+    if connectors is False:
+        settings["disableClaudeAiConnectors"] = True
+    if est and seat:
+        settings["autoMode"] = {"environment": auto_mode_environment(est, seat)}
     return json.dumps(settings)
+
+
+def auto_mode_environment(est: Estate, seat: str) -> list[str]:
+    """What the auto-mode classifier is told about this session, as prose, after
+    its defaults: which seat this is and what is the seat's own, then the estate's
+    `auto_mode_environment`. Context only: the mechanism writes no allow rule, so
+    this can say what is whose and never widens what is refused."""
+    name, s = est.seat(seat)
+    title = s.get("title", name)
+    lines = ["$defaults",
+             f"This session is the seat {title} ({s.get('kind', '?')}) in the {est.name} estate, run by the Curia "
+             f"mechanism on behalf of its principal, {est.principal}.",
+             f"The seat's own record is {est.seat_dir(name)}: its charter, handoff, journal, briefs, state notes and "
+             "logs are its to read and write.",
+             f"Worktrees under {est.worktrees_dir} are the estate's own fleet and crew homes.",
+             "`curia` commands are the mechanism's own: `curia stop`, `curia reap`, `curia dispatch`, `curia bg` and "
+             "`curia tell` act only on what the estate's record says is the estate's."]
+    if s.get("jurisdiction"):
+        lines.append(f"{title}'s jurisdiction: " + "; ".join(str(j) for j in s["jurisdiction"]) + ".")
+    extra = est.meta.get("auto_mode_environment")
+    if isinstance(extra, list):
+        lines += [str(x) for x in extra if str(x).strip()]
+    return lines
 
 
 def envelope_args(s: dict, *, headless: bool = False, skip_permissions: bool = False) -> list[str]:
@@ -1456,12 +1602,14 @@ def invoke_claude(cmd: list[str], cwd: Path, env: dict, timeout: int | None = No
         # left two of them holding their ports for two hours (2026-09-05).
         p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              stdin=subprocess.DEVNULL, start_new_session=True)
-        try:
-            out, err = p.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            end_group(p)
-            out, err = p.communicate()
-            raise subprocess.TimeoutExpired(cmd, timeout or 0, output=out, stderr=err)
+        with term_ends_group(p):   # `curia stop`: the run ends with its group, and this job writes the record
+            try:
+                out, err = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                end_group(p)
+                out, err = p.communicate()
+                raise subprocess.TimeoutExpired(cmd, timeout or 0, output=out, stderr=err)
+            end_group(p, 5.0)   # a run that ended well can still leave children in its group
         return subprocess.CompletedProcess(cmd, p.returncode, out, err)
     if watch is None:
         return subprocess.call(cmd, cwd=cwd, env=env)
@@ -1502,6 +1650,198 @@ def end_group(p: subprocess.Popen, wait_seconds: float = 10.0) -> None:
             except PermissionError:
                 pass
             time.sleep(0.2)
+
+
+@contextlib.contextmanager
+def term_ends_group(p: subprocess.Popen):
+    """While a job waits on `p`, TERM to the job ends p's whole process group and the
+    job goes on to write its record. This is how `stop` works: what it signals is the
+    job itself, whose pid the record holds, so it cannot miss what `ps` cannot see."""
+    before = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda signum, frame: end_group(p))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, before if before is not None else signal.SIG_DFL)
+
+
+def ask_to_stop(o: dict, wait_seconds: float = 40.0) -> bool:
+    """TERM a job's own process, by the pid on its record line (a headless launcher or
+    a `bg` runner); True once it has gone, having ended what it started."""
+    try:
+        os.kill(o["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    t0 = time.time()
+    while time.time() - t0 < wait_seconds:
+        if not launcher_alive(o):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def run_processes() -> list[dict]:
+    """Every process of this user carrying a run id in its environment: pid,
+    command, run, estate. A session's descendants inherit CURIA_RUN whatever
+    process group or session they put themselves in, so this finds what a group
+    sweep misses, and it is what lets anything be stopped on proof of whose it is.
+    The environment is read from `ps`, apart from the command, so a command line
+    that merely mentions a run id proves nothing. Where ps cannot say, nothing: macOS
+    hides the environment of its own binaries (sh, sleep), and shows it for what
+    actually lingers (python, node), so a bare shell left behind is not found here."""
+    def ps(flags: str) -> list[str]:
+        try:
+            p = subprocess.run(["ps", flags, "-o", "pid=,command="], capture_output=True, text=True,
+                               errors="replace", timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return p.stdout.splitlines() if p.returncode == 0 else []
+    commands = {}
+    for line in ps("axww"):
+        bits = line.strip().split(None, 1)
+        if len(bits) == 2:
+            commands[bits[0]] = bits[1]
+    out = []
+    for line in ps("-axwwE" if sys.platform == "darwin" else "axeww"):
+        bits = line.strip().split(None, 1)
+        if len(bits) != 2 or not bits[0].isdigit() or not bits[1].startswith(commands.get(bits[0], "\0")):
+            continue
+        env = bits[1][len(commands[bits[0]]):]
+        run = re.search(r"(?:^|\s)CURIA_RUN=(\S+)", env)
+        if run:
+            estate = re.search(r"(?:^|\s)CURIA_ESTATE=(\S+)", env)
+            out.append({"pid": int(bits[0]), "command": commands[bits[0]], "run": run.group(1),
+                        "estate": estate.group(1) if estate else ""})
+    return out
+
+
+def curia_job(command: str) -> bool:
+    """A curia command that keeps a record (`dispatch`, `run`, `bg`, a launcher):
+    started from a session's shell it carries that session's run id in its original
+    environment, and it is meant to outlive that session. `watch` and `hook` are not.
+    The program itself, or a python running it: an argument that merely ends in the
+    name is not."""
+    m = re.match(r"(?:\S*python[\d.]*\s+)?(?:\S*/)?curia(?:\s+--estate\s+\S+)?\s+(\S+)", command, re.I)
+    return bool(m) and m.group(1) not in ("watch", "hook")
+
+
+# Daemons a session may have been the first to start, and others now share: stopping
+# one with that session would stop it under everyone. estate.toml `sweep_spares` adds to it.
+SWEEP_SPARES = ("tmux", "screen", "dolt", "bd", "ssh-agent", "gpg-agent", "watchman", "syncthing", "caffeinate")
+
+
+def leftover(est: Estate, command: str) -> bool:
+    """Is this process something a finished run left behind, and so to be stopped?"""
+    spares = set(SWEEP_SPARES) | {str(x) for x in est.meta.get("sweep_spares") or []}
+    words = command.split()
+    return bool(words) and Path(words[0]).name not in spares and not curia_job(command)
+
+
+def still_running(pid: int) -> bool:
+    """Alive and not merely a zombie waiting on its parent."""
+    if not pid_alive(pid):
+        return False
+    try:
+        p = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return p.returncode == 0 and not p.stdout.strip().startswith("Z")
+
+
+def stop_processes(procs: list[dict], wait_seconds: float = 5.0) -> int:
+    """TERM, a wait, then KILL, for processes that are no group of ours. How many went."""
+    pids = {p["pid"] for p in procs if p["pid"] != os.getpid()}
+    total = len(pids)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in sorted(pids):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        t0 = time.time()
+        while time.time() - t0 < wait_seconds:
+            pids = {pid for pid in pids if still_running(pid)}
+            if not pids:
+                return total
+            time.sleep(0.2)
+    return total - len(pids)
+
+
+def process_names(procs: list[dict]) -> str:
+    """Commands as one record field: their program names, no spaces, bounded."""
+    return ",".join(sorted({Path(p["command"].split()[0]).name for p in procs if p["command"].split()}))[:120] or "?"
+
+
+def sweep_run(est: Estate, sd: Path, run: str) -> int:
+    """A session is over: nothing of it stays. A seat's probe, server or pytest
+    that outlives its session holds memory nobody will free and that nobody else
+    may kill (one ran 6.5 hours at full CPU). `curia bg` is the way to outlive a session."""
+    procs = [p for p in run_processes() if p["run"] == run and leftover(est, p["command"])]
+    if not procs:
+        return 0
+    n = stop_processes(procs)
+    what = process_names(procs)
+    log_session(sd, "sweep", f"session={run} killed={n} what={what}")
+    print(f"curia: swept {n} process(es) the session left running: {what}", file=sys.stderr)
+    return n
+
+
+def swap_used_gb() -> float | None:
+    """Swap in use, as the OS reads it; None where it cannot say."""
+    try:
+        if sys.platform == "darwin":
+            p = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=2)
+            m = re.search(r"used\s*=\s*([\d.]+)([MG])", p.stdout)
+            return float(m.group(1)) / (1 if m.group(2) == "G" else 1024) if m else None
+        mem = dict(line.split(":", 1) for line in read(Path("/proc/meminfo")).splitlines() if ":" in line)
+        return (int(mem["SwapTotal"].split()[0]) - int(mem["SwapFree"].split()[0])) / 1024 ** 2
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError):
+        return None
+
+
+def machine_reading(path: Path) -> dict:
+    """What the machine can still hold: free disk under `path`, swap in use, in GB."""
+    try:
+        free = shutil.disk_usage(path).free / 1024 ** 3
+    except OSError:
+        free = None
+    return {"disk_free_gb": free, "swap_used_gb": swap_used_gb()}
+
+
+def floor_breaches(est: Estate) -> list[str]:
+    """What is past the estate's floors, in words; [] when nothing is."""
+    m = machine_reading(est.dir)
+    out = []
+    disk, swap = est.threshold("floor_disk_gb"), est.threshold("floor_swap_gb")
+    if disk > 0 and m["disk_free_gb"] is not None and m["disk_free_gb"] < disk:
+        out.append(f"{m['disk_free_gb']:.1f} GB free on disk (floor_disk_gb is {disk:g})")
+    if swap > 0 and m["swap_used_gb"] is not None and m["swap_used_gb"] > swap:
+        out.append(f"{m['swap_used_gb']:.1f} GB of swap in use (floor_swap_gb is {swap:g})")
+    return out
+
+
+def check_floor(est: Estate, seat: str, what: str, ignore: bool = False) -> None:
+    """Refuse new work on a machine past its floor, and tell the principal, at most
+    hourly: nothing else on the estate owns the machine, and a night ran it to 144 MB
+    free and 48 GB of swap with every job still being started."""
+    breaches = floor_breaches(est)
+    if not breaches:
+        return
+    said = "; ".join(breaches)
+    if ignore:
+        print(f"curia: the machine is past its floor ({said}); going on, as --ignore-floor says", file=sys.stderr)
+        return
+    fence_log(est, seat, "machine-floor", f"{what}: {said}")
+    told = est.dir / "brain" / "floor-told"
+    if not told.exists() or time.time() - told.stat().st_mtime >= 3600:
+        told.parent.mkdir(parents=True, exist_ok=True)
+        told.touch()
+        notify(est, "NEEDS YOU: the machine is past its floor",
+               f"{said}. New jobs are being refused ({seat}: {what}) until there is room.")
+    die(f"the machine is past its floor ({said}), so {what} did not start. Free room first; "
+        "--ignore-floor is for the job that frees it.")
 
 
 DETACH_RUNS = True   # tests run the body in-process; the binary detaches
@@ -1555,6 +1895,8 @@ def run_detached(sd: Path, title: str, label: str, body, wait: bool) -> None:
             os.close(null)
             sys.stdout = os.fdopen(1, "w", buffering=1)
             sys.stderr = os.fdopen(2, "w", buffering=1)
+            os.environ.pop("CURIA_RUN", None)   # the job outlives the session that asked for it; so do its children
+            os.environ["CURIA_JOB_LOG"] = str(log)
             os.write(w, f"pid={os.getpid()}\n".encode())
             try:
                 rc = int(body() or 0)
@@ -1669,6 +2011,26 @@ def filed_by(i: dict, by: list[str]) -> bool:
     return bool(who & {str(i.get(k) or "").casefold() for k in ("created_by", "owner")})
 
 
+def own_actors(est: Estate, by: list[str]) -> set[str]:
+    """Whose name on a bead means the work is going on here: those named in --by, the
+    seats, the principal, and this machine's git identity, which is what `bd update
+    --claim` writes unless told otherwise. A claim must never read as a hand-off: the
+    bead would leave the night's scope and the board could read clear mid-work."""
+    names = set(by) | set(est.roster) | {str(v.get("title") or "") for v in est.roster.values()} | {est.principal}
+    for key in ("user.name", "user.email"):
+        names.add(git(["config", key], est.root, check=False).stdout.strip())
+    return {n.casefold() for n in names if n}
+
+
+def handed_off(i: dict, ours: set[str]) -> bool:
+    """Assigned to someone outside the night, who did not file it themselves. Exact,
+    in any case; never a judgment."""
+    who = str(i.get("assignee") or "").strip().casefold()
+    if not who or who in ours:
+        return False
+    return who not in {str(i.get(k) or "").casefold() for k in ("created_by", "owner")}
+
+
 def is_deferred(i: dict, at: dt.datetime | None = None) -> bool:
     """Set aside, as `bd ready` reads it: deferred with no date (until someone
     undefers it), or a date still ahead. A date that has passed makes the bead
@@ -1704,8 +2066,13 @@ def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None,
     those people filed are sorted, against the whole board: a blocker someone
     else closed is no blocker, and one still open is off this night's board,
     so what it blocks waits on a person. others: the open beads left out. at:
-    the time deferral dates are read against, by default now."""
-    mine = [i for i in issues if not by or filed_by(i, by)]
+    the time deferral dates are read against, by default now. A bead assigned to
+    someone who is none of own_actors, and did not file it, has been handed to them,
+    so it is theirs whoever filed it. epics: open epics with nothing workable beneath them,
+    in no other list: an epic is a folder, and counting folders as work kept a board
+    that waited only on people from ever being clear."""
+    ours = own_actors(est, by) if by else set()
+    mine = [i for i in issues if not by or (filed_by(i, by) and not handed_off(i, ours))]
     scope = {i["id"] for i in mine}
     status = {i["id"]: i.get("status") for i in issues}
     labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
@@ -1726,7 +2093,7 @@ def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None,
             if all(b in human or b not in scope for b in blockers[i["id"]]):
                 human.add(i["id"])
                 grew = True
-    out: dict = {"ready": [], "working": [], "blocked": [], "human": [],
+    out: dict = {"ready": [], "working": [], "blocked": [], "human": [], "epics": [],
                  "closed": sum(1 for i in mine if i.get("status") == "closed"),
                  "others": [i for i in issues if i["id"] not in scope and i.get("status") != "closed"]}
     for i in mine:
@@ -1741,6 +2108,29 @@ def sort_board(est: Estate, issues: list[dict], by: list[str] | None = None,
             out["working"].append(i)
         else:
             out["ready"].append(i)
+    children: dict[str, list[str]] = {}
+    for i in issues:
+        for d in i.get("dependencies", []):
+            if d.get("type") == "parent-child":
+                children.setdefault(d["depends_on_id"], []).append(i["id"])
+    kinds = {i["id"]: i.get("issue_type") for i in issues}
+    workable = {i["id"] for k in ("ready", "working", "blocked") for i in out[k] if kinds[i["id"]] != "epic"}
+
+    def holds_work(eid: str) -> bool:
+        seen, todo = {eid}, list(children.get(eid, []))
+        while todo:
+            c = todo.pop()
+            if c in workable:
+                return True
+            if c not in seen:
+                seen.add(c)
+                todo += children.get(c, [])
+        return False
+
+    for k in ("ready", "working", "blocked"):
+        for i in [x for x in out[k] if kinds[x["id"]] == "epic" and not holds_work(x["id"])]:
+            out[k].remove(i)
+            out["epics"].append(i)
     return out
 
 
@@ -1824,7 +2214,7 @@ def by_others(b: dict) -> str:
     """The open beads a --by left out of a board, and who filed them."""
     who: dict[str, int] = {}
     for i in b["others"]:
-        k = str(i.get("created_by") or i.get("owner") or "?")
+        k = str(i.get("assignee") or i.get("created_by") or i.get("owner") or "?")
         who[k] = who.get(k, 0) + 1
     named = ", ".join(f"{k} {v}" for k, v in sorted(who.items(), key=lambda kv: (-kv[1], kv[0])))
     return f"{len(b['others'])} open by others" + (f" ({named})" if named else "")
@@ -1855,6 +2245,75 @@ def by_checked(est: Estate, repos: list[str], by: list[str]) -> list[str]:
     return by
 
 
+SETTLE_POLL_SECONDS = 60.0
+RED_CONCLUSIONS = ("failure", "timed_out", "startup_failure")
+GREEN_CONCLUSIONS = ("success", "neutral", "skipped")
+
+
+def integration_target(est: Estate, repo: str) -> tuple[str, str] | None:
+    """(forge slug, branch) of the repo's integration runs; None with nothing to wait
+    on: no forge to ask, no gate, no such branch."""
+    _, r = est.repo(repo)
+    branch = r.get("integration_branch")
+    if r.get("forge") != "github" or not r.get("remote") or not r.get("gate") or not branch:
+        return None
+    return repo_slug(r["remote"]), branch
+
+
+def integration_runs(slug: str, branch: str, since: dt.datetime) -> list[dict] | None:
+    """The CI runs on a branch that started since `since`; None when gh cannot say. A
+    run on an earlier commit counts: the tip of a board push often has no run, and the
+    run that matters is the one behind it."""
+    runs = gh_json(["run", "list", "--repo", slug, "--branch", branch, "--limit", "30",
+                    "--json", "status,conclusion,url,createdAt,workflowName"])
+    if runs is None:
+        return None
+    return [x for x in runs if (parse_iso(str(x.get("createdAt") or "")) or since) >= since]
+
+
+def settle_board(est: Estate, repo: str, since: dt.datetime, minutes: float, deadline: float | None = None) -> dict:
+    """Wait, spending nothing, on the integration runs of what a loop landed, then
+    say how they stand: state is green, red, unfinished or none, line says so in
+    words, url names the red one. The newest run of each workflow speaks for that
+    workflow, so a red that a later run put right is not red, and only a success is
+    green. One red is enough to stop waiting. `deadline` (monotonic) is shared when a
+    loop worked several boards. A loop once stopped with its run still going; the run
+    went red eleven minutes later and nobody read it for three hours."""
+    target = integration_target(est, repo)
+    if target is None:
+        return {"state": "none", "line": "", "url": ""}
+    deadline = time.monotonic() + minutes * 60 if deadline is None else deadline
+    empty_looks = 0
+    while True:
+        runs = integration_runs(*target, since)
+        if runs is None:
+            return {"state": "unfinished", "url": "",
+                    "line": f"gh could not say how {repo}'s integration run stands: {GH_ERROR or 'no reason given'}"}
+        latest: dict[str, dict] = {}
+        for x in sorted(runs, key=lambda x: str(x.get("createdAt") or "")):
+            latest[str(x.get("workflowName") or "?")] = x
+        red = [x for x in latest.values() if x.get("status") == "completed" and x.get("conclusion") in RED_CONCLUSIONS]
+        if red:
+            names = ", ".join(sorted(str(x.get("workflowName") or "?") for x in red))
+            return {"state": "red", "line": f"{repo}'s integration run went red: {names}, {red[0].get('url', '')}",
+                    "url": str(red[0].get("url") or "")}
+        going = [x for x in latest.values() if x.get("status") != "completed"]
+        if not latest and empty_looks >= 1:
+            return {"state": "none", "line": f"no integration run in {repo} since this launcher began", "url": ""}
+        if latest and not going:
+            other = [x for x in latest.values() if x.get("conclusion") not in GREEN_CONCLUSIONS]
+            if other:
+                return {"state": "unfinished", "url": "", "line": f"{repo}'s integration run ended "
+                        + ", ".join(f"{x.get('conclusion') or '?'} ({x.get('url') or '?'})" for x in other)}
+            return {"state": "green", "line": f"{repo}'s integration run is green", "url": ""}
+        if time.monotonic() >= deadline:
+            return {"state": "unfinished", "url": "",
+                    "line": f"{repo}'s integration run was still going after {minutes:g} minutes: "
+                            + ", ".join(str(x.get("url") or "?") for x in going)}
+        empty_looks += 0 if latest else 1
+        time.sleep(SETTLE_POLL_SECONDS)
+
+
 def everything_orders(repo: str, b: dict, night: str = "", by: list[str] | None = None) -> str:
     """Tonight's orders for a seat working a board until it is clear. With
     `by`, every id is named: the list is the scope, so a dozen and an ellipsis
@@ -1873,13 +2332,20 @@ def everything_orders(repo: str, b: dict, night: str = "", by: list[str] | None 
             f"{len(b['ready'])} ready ({ids(b['ready'])}), {len(b['working'])} in progress "
             f"({ids(b['working'])}), {len(b['blocked'])} blocked by other beads on the board"
             + (f" ({ids(b['blocked'])})" if by else "") + ", "
-            f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone, and say in your "
-            "handoff what would unblock each). Per your charter: claim what is ready, design and dispatch or "
-            "implement, get it reviewed and landed, close it, and move to the next. When the shift hook says "
+            f"{len(b['human'])} waiting on a human ({ids(b['human'])}; leave those alone: `curia waiting {repo}` "
+            "lists them by person with what each would unblock, so your handoff says only what changed there)."
+            + (f" {len(b['epics'])} epics hold nothing workable and are not work." if b.get("epics") else "") +
+            " Per your charter: claim what is ready, design and dispatch or "
+            "implement, get it reviewed and landed, close it, and move to the next. To wait on a job, run "
+            "`curia watch` under your Monitor tool and end your turn rather than sleep in a tool call; start "
+            "what must outlive this session with `curia bg`. A question to the principal stops you until it "
+            "is answered, so ask only when nothing else can go on, and otherwise put it in your handoff. "
+            "When the shift hook says "
             "so, or when the board is clear, make sure the board on disk is true (`bd export -o .beads/issues.jsonl`, or this "
             "repo's sync) and pushed, then /handoff: the launcher reads the board as pushed to origin's integration "
-            "branch and wakes you again with it as it then stands, and "
-            "stops when nothing remains. Never close a bead that did not land.")
+            "branch and wakes you again with it as it then stands. The loop stops itself when nothing remains, "
+            "or when two wakings in a row leave the board unmoved, and then waits on the integration run of what "
+            "landed, so nobody needs asking to stop it. Never close a bead that did not land.")
     if night:
         return night + "\n\n" + board_orders
     return board_orders
@@ -1984,10 +2450,11 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     if restart.exists():
         restart.unlink()
         print(f"curia: cleared a stale RESTART marker for {title}; this launch is the waking it asked for")
-    for stale in ("LIMITED", "SHIFT-OVER", "ENDED"):
+    for stale in ("LIMITED", "SHIFT-OVER", "SHIFT-TOLD", "SHIFT-CHECKED", "ENDED"):
         (sd / stale).unlink(missing_ok=True)   # left by a session that is over
-    for stale in sd.glob("LIMITED-*"):
-        stale.unlink(missing_ok=True)   # a headless run's, long over
+    for pattern in ("LIMITED-*", "ASKING-*"):
+        for stale in sd.glob(pattern):
+            stale.unlink(missing_ok=True)   # a headless run's, long over; a question nobody can answer now
     limited_marker = sd / "LIMITED"
     ended_marker = sd / "ENDED"   # the Stop hook touches it when handoff --done has run and the turn is over
     waiting = False   # every account limited: said once, then slept out in slices
@@ -2000,6 +2467,40 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     last_counts: dict | None = None   # --everything: the board as last read, so a handoff can say how it moved
     handed_off, last_tail = False, ""   # the session just ended wrote its handoff; what its end line said
     last_need: float | None = None      # jev's reading of whether that handoff waits on the principal
+    night_began = now()
+    worked = list(repos[:1])            # --everything: every board this launcher has worked, for the last act
+    last_waking = False                 # --everything: the one waking a red integration run earns
+
+    def last_act(subject: str, msg: str) -> bool:
+        """The last thing a loop does: wait on the integration runs of what it landed,
+        spending nothing, and put how they stand in the final notice. True when one is
+        red and the night has room for one more waking, whose orders are that run."""
+        nonlocal orders, repo, home, last_waking
+        minutes = est.threshold("settle_minutes")
+        wait = minutes * 60   # one wait for the whole night, whatever the boards, and never past its deadline
+        if until_dt:
+            wait = min(wait, max(0.0, (until_dt - now()).total_seconds()))
+        deadline = time.monotonic() + wait
+        results = [(r, settle_board(est, r, night_began, minutes, deadline)) for r in worked] if minutes > 0 else []
+        lines = [x["line"] for _, x in results if x["line"]]
+        for r, x in results:
+            if x["state"] != "none":
+                log_session(sd, "settled", f"repo={r} state={x['state']}" + (f" url={x['url']}" if x["url"] else ""))
+        red = next(((r, x) for r, x in results if x["state"] == "red"), None)
+        notify(est, ("NEEDS YOU: " if red else "") + subject, " ".join([msg] + lines))
+        for line in lines:
+            print("curia: " + line)
+        # Nothing of this seat is awake while the launcher waits, so someone may have launched it meanwhile.
+        awake = [o for o in open_sessions(sd) if o["pid"] and o["pid"] != os.getpid() and launcher_alive(o)]
+        if not red or awake or check_night_over():
+            return False
+        repo, home = red[0], est.repo_path(red[0])
+        orders = (f"Tonight's work is done, and {red[1]['line']}. One waking, and the launcher stops after it: diagnose "
+                  "that run and do what your charter says about a red integration branch (a postmortem bead, the fix "
+                  "landed or opened). Leave the rest of the board alone, then /handoff."
+                  + (f"\n\nAlso, from the principal: {say}" if say else ""))
+        last_waking = True
+        return True
 
     def left_alone(b: dict) -> str:
         """What a --by night says it did not touch, wherever it says the board is done or stuck."""
@@ -2042,6 +2543,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             return False
         repo = queue.pop(0)
         home = est.repo_path(repo)
+        worked.append(repo)
         seen_board, idle_rounds, last_counts = None, 0, None
         print(f"curia: {title} moves on to {repo}'s board ({len(queue)} more after it)")
         log_session(sd, "next", f"repo={repo} after={len(queue)}")
@@ -2050,7 +2552,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
     while True:
         if check_night_over():
             break
-        if everything:
+        if everything and not last_waking:
             b = board(est, repo, by)
             counts = board_counts(b)
             log_session(sd, "board", f"repo={repo} {board_detail(counts)} fresh={'yes' if b.get('fresh', True) else 'no'}"
@@ -2070,8 +2572,12 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                        f"({len(b['human'])} waiting, {b['closed']} closed)." + left_alone(b))
                 print("curia: " + msg)
                 log_session(sd, "clear", f"repo={repo} human={len(b['human'])} closed={b['closed']}")
-                notify(est, f"{title}: board clear in {repo}" + (f" (beads by {', '.join(by)})" if by else ""), msg)
-                if next_board():
+                subject = f"{title}: board clear in {repo}" + (f" (beads by {', '.join(by)})" if by else "")
+                if queue:
+                    notify(est, subject, msg)
+                    next_board()
+                    continue
+                if last_act(subject, msg):
                     continue
                 break
             # The board moved when anything open changed status or was touched, or something closed: a
@@ -2092,8 +2598,11 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                           "stopping so someone can look, rather than spinning.") + left_alone(b))
                 print("curia: " + msg, file=sys.stderr)
                 log_session(sd, "stalled", f"repo={repo} remaining={len(remaining)}")
-                notify(est, f"{title}: no progress in {repo}", msg)
-                if next_board():
+                if queue:
+                    notify(est, f"{title}: no progress in {repo}", msg)
+                    next_board()
+                    continue
+                if last_act(f"{title}: no progress in {repo}", msg):
                     continue
                 break
             orders = everything_orders(repo, b, night_ord, by) + (f"\n\nAlso, from the principal: {say}" if say else "")
@@ -2127,10 +2636,13 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             env["CURIA_NIGHT_SINCE"] = night_since.isoformat()
         if loop or everything:
             env["CURIA_LOOP"] = "1"   # the shift hook may promise a relaunch only when there is one
+        for stale in ("SHIFT-OVER", "SHIFT-TOLD", "SHIFT-CHECKED"):
+            (sd / stale).unlink(missing_ok=True)   # what the last session was told is not this one's
         prime = prime_file(est, name, recalled=recall_for(est, name, recall_query(est, name, say)))
         cmd = ["claude", "--name", title, "--append-system-prompt-file", str(prime),
                "--settings", seat_settings(est, seat=name, cfg=cfg)]
         sid = str(uuid.uuid4())
+        env["CURIA_RUN"] = sid
         cmd += ["--session-id", sid]
         if s.get("model"):
             cmd += ["--model", s["model"]]
@@ -2147,6 +2659,7 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
                                watch=lambda: marker_names(limited_marker, sid) or ended_marker.exists())
         finally:
             prime.unlink(missing_ok=True)
+            sweep_run(est, sd, sid)
         tail = ""
         usage = session_usage(cfg, sid)
         if usage:
@@ -2189,6 +2702,15 @@ def launch_seat(est: Estate, seat: str, *, repo: str | list[str] | None = None, 
             if not loop:
                 break
             continue
+        if last_waking:
+            restart.unlink(missing_ok=True)
+            if handed_off:
+                notify(est, f"{title} has answered the red run in {repo}",
+                       principal_line(sd / "handoff.md") or f"{title} handed off and said nothing for you.", sd / "handoff.md")
+            else:
+                notify(est, f"NEEDS YOU: {title} did not answer the red run in {repo}",
+                       f"Its one waking ended (rc {rc}) without a handoff. The run is still red; the launcher stops here.")
+            break
         if loop and restart.exists():
             restart.unlink()
             print(f"curia: {title} asked to be woken again; relaunching with the new handoff")
@@ -2251,6 +2773,7 @@ def cmd_run(a) -> None:
               "".join(" " + x for x in envelope_args(s, headless=True, skip_permissions=a.skip_permissions)) +
               " --settings <" + hooks_summary(est, headless=True) + listing_summary(est, name, cfg) + ">")
         return
+    check_floor(est, name, f"run {prompt_path.name}", getattr(a, "ignore_floor", False))
     beads = [b for x in (a.bead or []) for b in x.split(",") if b.strip()]
     if not beads and subs.get("bead"):
         beads = [b for b in str(subs["bead"]).split(",") if b.strip()]
@@ -2402,6 +2925,7 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
                           CURIA_HEADLESS="1", CURIA_JOURNAL=str(journal))   # the one record file this waking may write
         env.pop("CURIA_JEV_KEY", None)
         sid = str(uuid.uuid4())
+        env["CURIA_RUN"] = sid
         orders = JOURNAL_ORDERS.format(path=journal, seconded=SECONDED_ORDERS.format(model=model_now)
                                        if seconded else "")
         cmd = ["claude", "-p", prompt + orders, "--session-id", sid,
@@ -2413,7 +2937,7 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
             cmd.append("--dangerously-skip-permissions")
         cmd += envelope_args(s, headless=True, skip_permissions=skip_permissions)
         log_session(sd, "start", f"headless account={acct} model={model_now or '?'} cwd={cwd} "
-                                 f"session={sid} pid={os.getpid()}" + (" fallback" if fell_back else "")
+                                 f"session={sid} pid={os.getpid()} run={sid}" + (" fallback" if fell_back else "")
                     + (" seconded" if seconded else ""))
         started = now()
         try:
@@ -2424,6 +2948,7 @@ def run_headless(est: Estate, name: str, s: dict, prompt: str, cwd: Path,
             res = HeadlessResult(text=f"[timeout after {timeout}s]\n{partial}", rc=124)
         finally:
             prime.unlink(missing_ok=True)
+            sweep_run(est, sd, sid)
         if res.duration_ms is None:
             res.duration_ms = int((now() - started).total_seconds() * 1000)
         res.accounts = list(tried)
@@ -2493,7 +3018,7 @@ def cmd_handoff(a) -> None:
                 f". The template is {MECHANISM_DIR / 'templates' / 'handoff.md'}; write every section, "
                 "even if only to say there is nothing under it")
         (sd / "RESTART").touch()
-        for marker in ("LAST-LIMITED", "SHIFT-OVER"):
+        for marker in ("LAST-LIMITED", "SHIFT-OVER", "SHIFT-TOLD"):
             (sd / marker).unlink(missing_ok=True)   # memory is fresh again; the shift's orders are done
         log_session(sd, "handoff", "")
         print(f"Handoff recorded for {s.get('title', name)}. This turn is the session's last: the launcher ends "
@@ -2951,15 +3476,28 @@ def needs_principal(est: Estate, seat: str, note: Path) -> float | None:
     said = handoff_section(note, "For the principal")
     if not jev_on(est) or len(said) < 12:
         return None
-    ans = jev(est, {"for_the_principal": clip(said, 4000)},
-              {"needs": {"type": "noul",
-                         "instructions": "`for_the_principal` is what a worker wrote, at the end of a shift, for the "
-                                         "person they answer to. Does it ask that person for a decision, an answer "
-                                         "or an action that work is waiting on?",
-                         "criteria": {"true": "It asks for something, and some work cannot go on until it is given.",
-                                      "false": "It reports, thanks, or says there is nothing; no work waits on a reply."}}},
-              why=f"handoff:{seat.lower()}", deadline=time.monotonic() + RECALL_SECONDS)
-    return jev_noul(ans, "needs")
+    questions = {"needs": {"type": "noul",
+                           "instructions": "`for_the_principal` is what a worker wrote, at the end of a shift, for the "
+                                           "person they answer to. Does it ask that person for a decision, an answer "
+                                           "or an action that work is waiting on?",
+                           "criteria": {"true": "It asks for something, and some work cannot go on until it is given.",
+                                        "false": "It reports, thanks, or says there is nothing; no work waits on a reply."}}}
+    state = {"for_the_principal": clip(said, 4000)}
+    # A board that waits on people asks them something at every shift, so nearly every handoff reads as
+    # needing the principal (median 0.94 over 52). What the principal needs to hear is a new ask.
+    hist = sorted((note.parent / "history").glob("*.md"))
+    before = handoff_section(hist[-1], "For the principal") if hist else ""
+    if before:
+        state["asked_at_the_last_shift"] = clip(before, 4000)
+        questions["new_ask"] = {"type": "noul",
+                                "instructions": "`asked_at_the_last_shift` is what the same worker asked for one shift "
+                                                "earlier. Does `for_the_principal` ask for anything not already asked there?",
+                                "criteria": {"true": "At least one ask is new or has materially changed.",
+                                             "false": "Every ask was already there, or it asks for nothing."}}
+    ans = jev(est, state, questions, why=f"handoff:{seat.lower()}", deadline=time.monotonic() + RECALL_SECONDS)
+    needs = jev_noul(ans, "needs")
+    new = jev_noul(ans, "new_ask")
+    return min(needs, new) if needs is not None and new is not None else needs
 
 
 def handoff_lint(est: Estate, seat: str, note: Path) -> list[str] | None:
@@ -4772,7 +5310,63 @@ def prepare_worktree(est: Estate, seat_key: str, repo_key: str, bead: str) -> tu
         path.parent.mkdir(parents=True, exist_ok=True)
         git(["worktree", "add", "-q", str(path), branch] if exists
             else ["worktree", "add", "-q", "-b", branch, str(path), ref], src)
+    if exists and fetch_origin(path, branch):   # a reviewer pushes from a home of its own
+        git(["merge", "-q", "--ff-only", f"refs/remotes/origin/{branch}"], path, check=False)
     return path, branch
+
+
+def session_cwd(detail: str) -> str:
+    """The cwd on a session's start line, which may hold spaces, resolved."""
+    m = re.search(r"(?:^|\s)cwd=(.*?)(?=\s+session=|\s*$)", detail)
+    return str(Path(m.group(1)).resolve()) if m else ""
+
+
+def home_holders(est: Estate, path: Path) -> list[tuple[str, dict]]:
+    """(seat, open session) for every live session, of any seat, working in `path`.
+    A start whose launcher is gone holds nothing; `reap` closes its record."""
+    want = str(path.resolve())
+    return [(k, o) for k in est.roster for o in open_sessions(est.seat_dir(k))
+            if session_cwd(o["detail"]) == want and launcher_alive(o)]
+
+
+def claim_review_home(est: Estate, reviewer: str, repo_key: str, branch: str) -> Path | None:
+    """A home of the reviewer's own, at the branch's tip on a detached HEAD:
+    worktrees/<reviewer>/<repo>-review, then -2, -3 for reviews running at once. The
+    worker's home is the worker's: a review run there holds the worker idle until the
+    verdict, and the next dispatch checks another branch out under a running gate.
+    Reused, so what provisioning it holds is kept; one with uncommitted work is left
+    alone and the next is taken. Claimed under a lock, by a file naming this process,
+    because a session's start line is written only later. None when none can be made."""
+    src = est.repo_path(repo_key)
+    base = worktree_path(est, reviewer, repo_key).with_name(f"{repo_key}-review")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    tip = branch   # what a reviewer before this one pushed is not on the local branch
+    remote = f"refs/remotes/origin/{branch}"
+    if fetch_origin(src, branch) and git(["merge-base", "--is-ancestor", branch, remote], src, check=False).returncode == 0:
+        tip = remote
+    with open(base.parent / ".claim.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        git(["worktree", "prune"], src, check=False)
+        for n in range(1, 20):
+            path = base if n == 1 else base.with_name(f"{base.name}-{n}")
+            claim = path.with_name(f".held-{path.name}")
+            holder = read(claim).strip()
+            if holder.isdigit() and pid_alive(int(holder)):
+                continue
+            if path.exists():
+                if home_holders(est, path) or git(["status", "--porcelain"], path, check=False).stdout.strip():
+                    continue
+                p = git(["checkout", "-q", "--detach", tip], path, check=False)
+            else:
+                p = git(["worktree", "add", "-q", "--detach", str(path), tip], src, check=False)
+            if p.returncode == 0:
+                claim.write_text(str(os.getpid()))
+                return path
+    return None
+
+
+def release_review_home(path: Path) -> None:
+    path.with_name(f".held-{path.name}").unlink(missing_ok=True)
 
 
 def assignments_log(sd: Path, event: str, detail: str) -> None:
@@ -4829,12 +5423,20 @@ def cmd_dispatch(a) -> None:
         print(f"worktree {subs['worktree']} on branch {subs['branch']} off {r.get('integration_branch', '?')}")
         print(config_dir_shown(cfg) + " CURIA_SEAT=" + name + " cwd=" + subs["worktree"])
         print(f"claude -p <{ppath.name}:{len(template)} chars + journal orders> --model "
-              f"{headless_model(s, a.model) or '?'}" + (f"; then review by {reviewer[0]}" if reviewer else ""))
+              f"{headless_model(s, a.model) or '?'}" + (f"; then review by {reviewer[0]} in a home of its own" if reviewer else ""))
         return
+    check_floor(est, name, f"dispatch {a.bead}", getattr(a, "ignore_floor", False))
+    held = [(k, o) for k, o in home_holders(est, worktree_path(est, name, rk)) if k.lower() != name.lower()]
+    if held and not getattr(a, "share", False):
+        k, o = held[-1]
+        die(f"{worktree_path(est, name, rk)} is in use: {est.roster[k].get('title', k)} has been working there for "
+            f"{age(o['at'])} (session {o['sid'] or '?'}). Two sessions in one tree overwrite each other's evidence; "
+            "wait for it, or pass --share if you mean it.")
     path, branch = prepare_worktree(est, name, rk, a.bead)
     subs["worktree"], subs["branch"] = str(path), branch
     prompt = fill_placeholders(template, subs)
-    assignments_log(sd, "dispatch", f"bead={a.bead} repo={rk} branch={branch} worktree={path} by={by}")
+    assignments_log(sd, "dispatch", f"bead={a.bead} repo={rk} branch={branch} worktree={path}"
+                    + (f" review={reviewer[0]}" if reviewer else "") + f" by={by}")
     print(f"curia: {title} dispatched to {rk} for {a.bead}: {path} on {branch}", file=sys.stderr)
 
     recalled = recall_for(est, name, bead_text(est, rk, a.bead))
@@ -4848,15 +5450,269 @@ def cmd_dispatch(a) -> None:
             rname, rs = reviewer
             rtitle = rs.get("title", rname)
             _, rtemplate = prompt_text(est, a.review_prompt, "review.md")
-            rprompt = fill_placeholders(rtemplate, {**subs, "seat": rtitle, "worker": title})
-            print(f"curia: {rtitle} reviewing {a.bead} in {path}", file=sys.stderr)
-            rres = run_headless(est, rname, rs, rprompt, path, a.timeout, a.skip_permissions, None)
+            home = claim_review_home(est, rname, rk, branch)
+            if home is None:
+                assignments_log(sd, "reviewed", f"bead={a.bead} by={rname} rc=1 no home for the review")
+                print(f"curia: no home could be made for {rtitle}'s review of {a.bead}", file=sys.stderr)
+                return 1
+            try:
+                rprompt = (fill_placeholders(rtemplate, {**subs, "seat": rtitle, "worker": title, "worktree": str(home),
+                                                         "worker_home": str(path)})
+                           + REVIEW_HOME_ORDERS.format(home=home, branch=branch, worker_home=path))
+                print(f"curia: {rtitle} reviewing {a.bead} in {home}", file=sys.stderr)
+                assignments_log(sd, "reviewing", f"bead={a.bead} by={rname} home={home}")
+                rres = run_headless(est, rname, rs, rprompt, home, a.timeout, a.skip_permissions, None)
+            finally:
+                release_review_home(home)
             assignments_log(sd, "reviewed", f"bead={a.bead} by={rname} {rres.summary()}")
             print(f"\n--- review by {rtitle} ---\n{rres.text}")
             failed = failed or rres.failed
         return 1 if failed else 0
 
     run_detached(sd, title, a.bead, body, wait=not a.detach)
+
+
+# Said by the mechanism, so an estate's review brief written for the worker's home still works.
+REVIEW_HOME_ORDERS = """
+
+---
+
+You are in a home of your own at `{home}`, on a detached HEAD at the tip of `{branch}`; the worker's home is
+`{worker_home}` and is not yours to touch. Stay detached: checking `{branch}` out here would hold the branch and
+refuse the worker's next job on it. Push what you commit with `git push origin HEAD:{branch}`, and name the branch
+to gh (`gh pr view {branch}`), which cannot infer it from a detached HEAD."""
+
+WATCH_POLL_SECONDS = 5.0
+
+
+def cmd_watch(a) -> None:
+    """The estate's record as a stream, one line per event, spending nothing while
+    it waits: for a seat's Monitor tool, or `--once` under a background task. A seat
+    that waits this way ends its turn, so its hooks can speak. Lines are the record's
+    own; `--since` with the last time seen resumes after a handoff and misses nothing."""
+    est = find_estate(a.estate)
+    seats = [est.seat(s)[0] for s in a.seat or []] or list(est.roster)
+    events = {e.strip() for x in a.event or [] for e in x.split(",") if e.strip()}
+    match = re.compile(a.match) if a.match else None
+    since = parse_since(a.since) if a.since else None
+    names = ["assignments.log"] + (["sessions.log"] if a.sessions else [])
+    files = [(k, est.seat_dir(k) / n) for k in seats for n in names]
+    offsets = {f: 0 if since or not f.exists() else f.stat().st_size for _, f in files}
+    deadline = time.monotonic() + a.timeout if a.timeout else None
+    parent = os.getppid()
+    while True:
+        batch = []
+        for k, f in files:
+            size = f.stat().st_size if f.exists() else 0
+            at = offsets[f] if size >= offsets[f] else 0   # rewritten: read it from the top
+            if size <= at:
+                continue
+            with open(f, "rb") as h:
+                h.seek(at)
+                data = h.read()
+            end = data.rfind(b"\n")
+            if end < 0:
+                continue   # half a line; the rest comes next look
+            offsets[f] = at + end + 1
+            for line in data[:end].decode(errors="replace").splitlines():
+                bits = line.split(" ", 2)
+                if len(bits) < 2 or (events and bits[0] not in events):
+                    continue
+                when = parse_iso(bits[1])
+                detail = bits[2] if len(bits) > 2 else ""
+                if (since and (not when or when < since)) or (a.bead and detail_field(detail, "bead") != a.bead):
+                    continue
+                out = f"{bits[0]} {bits[1]} seat={k.lower()} {detail}".rstrip()
+                if not match or match.search(out):
+                    batch.append((bits[1], out))
+        for _, out in sorted(batch):
+            print(out, flush=True)
+        if batch and a.once:
+            return
+        if deadline and time.monotonic() >= deadline:
+            print(f"curia: watch: nothing more after {a.timeout}s", file=sys.stderr)
+            sys.exit(3)
+        if os.getppid() != parent:
+            return   # whoever asked has gone; nobody is reading this
+        time.sleep(WATCH_POLL_SECONDS)
+
+
+def open_bg(sd: Path) -> list[dict]:
+    """A seat's `bg` jobs still running: label, run, pid, at. A job whose process
+    is gone with no `bg-done` is not running, whatever the record lacks."""
+    jobs: dict[str, dict] = {}
+    for line in read(sd / "assignments.log").splitlines():
+        bits = line.split(" ", 2)
+        if len(bits) < 3 or bits[0] not in ("bg", "bg-done"):
+            continue
+        run = detail_field(bits[2], "run")
+        if bits[0] == "bg-done":
+            jobs.pop(run, None)
+        else:
+            pid = detail_field(bits[2], "pid")
+            jobs[run] = {"run": run, "label": detail_field(bits[2], "label"), "at": bits[1],
+                         "pid": int(pid) if pid.isdigit() else None, "log": detail_field(bits[2], "log")}
+    return [j for j in jobs.values() if launcher_alive(j)]
+
+
+def cmd_bg(a) -> None:
+    """A command detached from the session that asked for it: its own process
+    session, a log with an EXIT= line at the end, `bg` and `bg-done` in the seat's
+    record, so `watch` can wait on it and it outlives a handoff."""
+    seat = a.seat or os.environ.get("CURIA_SEAT")
+    if not seat:
+        die("a job belongs to a seat: --seat <seat>, or run this from inside a seat session")
+    est = find_estate(a.estate, seat)
+    name, s = est.seat(seat)
+    sd = est.seat_dir(name)
+    if a.list:
+        jobs = open_bg(sd)
+        for j in jobs:
+            print(f"{j['label']}  {age(j['at'])}  pid {j['pid']}  run {j['run']}  {j['log']}")
+        if not jobs:
+            print(f"no background job of {name} is running")
+        return
+    cmd = list(a.command)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd or not cmd[0].strip():
+        die("nothing to run: curia bg [--label <label>] -- <command>")
+    argv = cmd if len(cmd) > 1 else ["sh", "-c", cmd[0]]
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", a.label or Path(cmd[0].split()[0]).name)[:40] or "job"
+    check_floor(est, name, f"bg {label}", a.ignore_floor)
+    cwd = Path(a.cwd).expanduser().resolve() if a.cwd else Path.cwd()
+    if not cwd.is_dir():
+        die(f"--cwd {cwd} is not a directory")
+    run = "bg-" + uuid.uuid4().hex[:12]
+    timeout = a.timeout or est.threshold("bg_hours") * 3600
+
+    def body() -> int:
+        log = os.environ.get("CURIA_JOB_LOG", "")
+        assignments_log(sd, "bg", f"label={label} run={run} pid={os.getpid()} log={log} cwd={cwd}")
+        print(f"$ {shlex.join(cmd)}", flush=True)
+        started = now()
+        try:
+            p = subprocess.Popen(argv, cwd=cwd, env=dict(os.environ, CURIA_RUN=run), stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        except OSError as e:
+            print(f"{e}\nEXIT=127", flush=True)
+            assignments_log(sd, "bg-done", f"label={label} run={run} rc=127 minutes=0.0 log={log}")
+            return 127
+        with term_ends_group(p):
+            try:
+                rc = p.wait(timeout=timeout)
+                end_group(p, 5.0)
+            except subprocess.TimeoutExpired:
+                end_group(p)
+                rc = 124
+        print(f"EXIT={rc}", flush=True)
+        minutes = (now() - started).total_seconds() / 60
+        assignments_log(sd, "bg-done", f"label={label} run={run} rc={rc} minutes={minutes:.1f} log={log}")
+        return 0 if rc == 0 else 1
+
+    run_detached(sd, s.get("title", name), f"bg-{label}", body, wait=a.wait)
+
+
+def cmd_stop(a) -> None:
+    """Stop a seat's headless run or background job, on the record's proof that it is
+    the seat's: TERM to the job on the record, which ends what it started and writes
+    its own end line; then whatever still carries the run id. What a seat may stop: its
+    own; an office with a fleet, any job on the estate; the principal, anything. A
+    session a person is at is no job, and is left to them. Says only what happened."""
+    est = find_estate(a.estate, a.seat)
+    name, s = est.seat(a.seat)
+    title = s.get("title", name)
+    sd = est.seat_dir(name)
+    caller_key, caller = mail_sender(est)
+    if caller_key and caller_key.lower() != name.lower() and not fleet_of(est, caller_key):
+        die(f"{caller} may not stop {title}: a seat stops its own work; an office with a fleet, any job; the principal, "
+            "anything. Ask whichever of them it should be")
+    why = f" why={urllib.parse.quote(a.why)}" if a.why else ""
+    by = urllib.parse.quote(caller)
+
+    def stop_one(o: dict, run: str) -> tuple[bool, int]:
+        """The job first, then what still carries its run id. (it went, stragglers stopped)"""
+        went = ask_to_stop(o)
+        return went, stop_processes([p for p in run_processes() if p["run"] == run and leftover(est, p["command"])])
+
+    if a.bg:
+        jobs = [j for j in open_bg(sd) if a.bg in (j["label"], j["run"])]
+        if not jobs:
+            die(f"{title} has no running background job '{a.bg}' (`curia bg --seat {name.lower()} --list`)")
+        for j in jobs:
+            went, n = stop_one(j, j["run"])
+            assignments_log(sd, "bg-stopped", f"label={j['label']} run={j['run']} went={'yes' if went else 'no'} "
+                                              f"stragglers={n} by={by}{why}")
+            print(f"{title}'s background job {j['label']} " + ("stopped" if went else f"is still running: pid {j['pid']} "
+                  "did not go within the wait; nothing more was done"))
+        return
+    live = [o for o in open_sessions(sd) if launcher_alive(o)]
+    if a.session:
+        live = [o for o in live if o["sid"] == a.session or (o["sid"] or "").startswith(a.session)]
+    awake = [o for o in live if not o["detail"].startswith("headless ")]
+    if awake and a.session:
+        die(f"session {awake[0]['sid']} is {title} awake with a person, not a headless run; it is theirs to end")
+    live = [o for o in live if o["detail"].startswith("headless ")]
+    if not live:
+        print(f"{title} has no headless run to stop")
+        return
+    if len(live) > 1 and not a.session and not a.all:
+        die(f"{title} has {len(live)} runs: " + ", ".join(f"{o['sid']} ({age(o['at'])})" for o in live)
+            + ". Name one with --session, or --all")
+    for o in live:
+        if not detail_field(o["detail"], "run"):
+            print(f"{title}'s session {o['sid']} started before `stop` existed and its launcher would die without ending "
+                  f"it; nothing was done. It ends by itself, or with its launcher pid {o['pid']} and its children by hand")
+            continue
+        went, n = stop_one(o, o["sid"])
+        log_session(sd, "stopped", f"session={o['sid']} went={'yes' if went else 'no'} stragglers={n} by={by}{why}")
+        print(f"{title}'s session {o['sid']} " + ("stopped" if went else f"is still running: launcher pid {o['pid']} did "
+              "not go within the wait; nothing more was done"))
+
+
+def cmd_waiting(a) -> None:
+    """Who the board is waiting on, by person, and what each answer would unblock:
+    the list a seat otherwise retypes into every handoff. Read-only and mechanical."""
+    est = find_estate(a.estate)
+    repo = a.repo or est.repo_here()
+    if not repo:
+        die("--repo, or run from inside one")
+    rk, _ = est.repo(repo)
+    b = board(est, rk, a.by)
+    labels = set(est.meta.get("human_labels") or HUMAN_LABELS)
+    waiters: dict[str, list[str]] = {}
+    for i in b["issues"]:
+        if i.get("status") != "closed":
+            for d in i.get("dependencies", []):
+                if d.get("type") == "blocks":
+                    waiters.setdefault(d["depends_on_id"], []).append(i["id"])
+
+    def unblocks(start: str) -> int:
+        seen: set[str] = set()
+        todo = list(waiters.get(start, []))
+        while todo:
+            x = todo.pop()
+            if x not in seen:
+                seen.add(x)
+                todo += waiters.get(x, [])
+        return len(seen)
+
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for i in b["human"]:
+        own = sorted(set(i.get("labels") or []) & labels)
+        if own:
+            who = re.sub(r"-question$", "", own[0])
+        elif is_deferred(i):
+            who = "deferred, until its date"
+        else:
+            who = "blocked by what waits on someone"
+        groups.setdefault(who, []).append((unblocks(i["id"]), i))
+    print(f"{rk}: {len(b['human'])} bead(s) waiting on a person" + (f"; beads by {', '.join(a.by)} only" if a.by else ""))
+    ranked = sorted(groups.items(), key=lambda kv: (-sum(n for n, _ in kv[1]), -len(kv[1]), kv[0]))
+    for who, items in ranked:
+        print(f"\n{who}: {len(items)} bead(s), unblocking {sum(n for n, _ in items)}")
+        for n, i in sorted(items, key=lambda x: (-x[0], x[1].get("priority", 9), x[1]["id"])):
+            print(f"  {i['id']:<16} {'unblocks ' + str(n) if n else '':<12} {str(i.get('title') or '')[:90]}")
 
 
 MERGED_PRS_ASKED = 300   # how far back reap looks for a merged PR by head branch
@@ -4965,6 +5821,10 @@ def reap(est: Estate, *, dry: bool, stale_days: float | None = None, say=print) 
     did = 0
     for k in est.roster:
         sd = est.seat_dir(k)
+        if (sd / "LIMITED").exists() and not open_sessions(sd):
+            say(f"  {k}: a LIMITED marker with no session awake" + ("; would clear it" if dry else "; cleared"))
+            if not dry:
+                (sd / "LIMITED").unlink(missing_ok=True)   # only a launch cleared these, and a fleet seat is never launched
         for o in open_sessions(sd):
             if not o["pid"]:
                 say(f"  {k}: a session from {age(o['at'])} ago has no end and no pid on record "
@@ -5096,9 +5956,38 @@ def reap(est: Estate, *, dry: bool, stale_days: float | None = None, say=print) 
             did += 1
         if elsewhere:
             say(f"  {rk}: {elsewhere} worktree(s) outside {SCRATCH_WORKTREES} and the fleet homes; left alone")
+    did += reap_orphans(est, dry, say)
     if not did:
         say("  nothing to reap")
     return did
+
+
+def reap_orphans(est: Estate, dry: bool, say=print) -> int:
+    """Processes of this estate whose run the record says is over: its session has
+    an end line or its launcher is gone, or its `bg` job is done. Proof, not a guess:
+    a process with no run id, a run id this estate never recorded, another estate's,
+    a live run's, and a curia job are all left alone."""
+    known: set[str] = set()
+    live: set[str] = set()
+    for k in est.roster:
+        sd = est.seat_dir(k)
+        known |= {detail_field(d, "session") for ev, _, d in session_events(sd) if ev == "start"}
+        live |= {o["sid"] for o in open_sessions(sd) if o["sid"] and launcher_alive(o)}
+        for line in read(sd / "assignments.log").splitlines():
+            bits = line.split(" ", 2)
+            if len(bits) == 3 and bits[0] == "bg":
+                known.add(detail_field(bits[2], "run"))
+        live |= {j["run"] for j in open_bg(sd)}
+    gone = [p for p in run_processes() if p["estate"] == str(est.dir) and p["run"] in known - live
+            and leftover(est, p["command"])]
+    if not gone:
+        return 0
+    runs = sorted({p["run"] for p in gone})
+    say(f"  {len(gone)} process(es) left by {len(runs)} finished run(s): {process_names(gone)}"
+        + ("; would stop them" if dry else "; stopped"))
+    if not dry:
+        stop_processes(gone)
+    return len(gone)
 
 
 def stale_days_of(est: Estate, given: float | None = None) -> float | None:
@@ -5465,23 +6354,49 @@ def cmd_ingest(a) -> None:
 
 # ----------------------------------------------------------------- notify
 
-def notify(est: Estate, subject: str, body: str, path: Path | None = None) -> None:
+def notify(est: Estate, subject: str, body: str, path: Path | None = None) -> bool:
     """Tell the principal, if the estate says how. estate.toml `notify` is a
     shell command run with CURIA_SUBJECT, CURIA_BODY and CURIA_REPORT in its
     environment; empty means nobody is told. Failing to notify is reported on
-    stderr and never fatal: the report is already on disk."""
+    stderr and never fatal: the report is already on disk. True when the command
+    ran and said it worked."""
     cmd = est.meta.get("notify", "")
     if not cmd:
-        return
+        return False
     env = dict(os.environ, CURIA_ESTATE=str(est.dir), CURIA_SUBJECT=subject, CURIA_BODY=body,
                CURIA_REPORT=str(path or ""))
     try:
         p = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         print("curia: notify command timed out", file=sys.stderr)
-        return
+        return False
     if p.returncode != 0:
         print(f"curia: notify command failed (rc={p.returncode}): {p.stderr.strip()}", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_tell(a) -> None:
+    """A seat, or anyone, tells the principal now through the estate's `notify`.
+    Mail waits for a waking; this does not, so it is counted and capped."""
+    est = find_estate(a.estate, os.environ.get("CURIA_SEAT"))
+    key, who = mail_sender(est)
+    if not est.meta.get("notify"):
+        die("estate.toml names no `notify` command, so nobody can be told this way; put it in your handoff")
+    if key:
+        sd = est.seat_dir(key)
+        hour_ago = now() - dt.timedelta(hours=1)
+        sent = [t for ev, t, _ in session_events(sd) if ev == "tell" and (parse_iso(t) or hour_ago) > hour_ago]
+        limit = int(est.threshold("tell_per_hour"))
+        if len(sent) >= limit:
+            die(f"{who} has told the principal {len(sent)} times in the last hour (tell_per_hour is {limit}); "
+                "nothing was sent. Put the rest in your handoff")
+    report = Path(a.report).expanduser().resolve() if a.report else None
+    if not notify(est, a.subject if not key else f"{who}: {a.subject}", a.body or a.subject, report):
+        die("the notify command failed; the principal was not told")
+    if key:
+        log_session(est.seat_dir(key), "tell", a.subject.replace("\n", " ")[:200])
+    print(f"told {est.principal}: {a.subject}")
 
 
 def principal_line(note: Path) -> str:
@@ -5581,6 +6496,62 @@ def file_age(p: Path | None) -> str:
     if not p or not p.exists():
         return "none"
     return age(dt.datetime.fromtimestamp(p.stat().st_mtime, dt.timezone.utc).isoformat()) + " ago"
+
+
+def claude_md_chain(cwd: Path, cfg: Path) -> list[Path]:
+    """The memory files Claude Code loads at start from `cwd`: the account's, then
+    every directory from the top down to cwd. @imports are not followed."""
+    found = [cfg / "CLAUDE.md"] if (cfg / "CLAUDE.md").is_file() else []
+    for d in reversed([cwd, *cwd.parents]):
+        found += [d / rel for rel in ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md") if (d / rel).is_file()]
+    return found
+
+
+def session_start_commands(cwd: Path, cfg: Path) -> list[tuple[str, str]]:
+    """(command, where) for the SessionStart hooks a session in `cwd` will run. Named,
+    not run: their output comes on top of everything `weight` can measure."""
+    out = []
+    for f in (cfg / "settings.json", cwd / ".claude" / "settings.json", cwd / ".claude" / "settings.local.json"):
+        d = read_json(f) if f.is_file() else None
+        for entry in ((d or {}).get("hooks") or {}).get("SessionStart") or []:
+            out += [(str(h["command"]), str(f)) for h in (entry.get("hooks") or []) if isinstance(h, dict) and h.get("command")]
+    return out
+
+
+def cmd_weight(a) -> None:
+    """What a waking carries before its first turn: nobody could see it, and at
+    every waking of every seat it is a fifth or more of what an estate spends."""
+    est = find_estate(a.estate, a.seat)
+    name, s = est.seat(a.seat)
+    repo = a.repo or est.repo_here()
+    cwd = est.repo_path(repo) if repo else est.root
+    if repo and s.get("kind") == "fleet" and worktree_path(est, name, est.repo(repo)[0]).is_dir():
+        cwd = worktree_path(est, name, est.repo(repo)[0])
+    _, cfg = resolve_account(est, s.get("account", ""), s.get("account", ""))
+    parts = prime_parts(est, name)
+    prime = sum(len(x.encode()) + 2 for x in parts)
+    named: dict[str, int] = {}
+    for x in parts:
+        named[prime_part_name(x)] = named.get(prime_part_name(x), 0) + len(x.encode())
+    chain = [(f, f.stat().st_size) for f in claude_md_chain(cwd, cfg)]
+    total = prime + sum(n for _, n in chain)
+    print(f"{s.get('title', name)} wakes in {cwd} with {total // 1024} KB of standing text, roughly "
+          f"{total // 4000}k tokens, before its first turn and before what Claude Code adds itself.\n")
+    print(f"  prime  {prime // 1024} KB")
+    for part, n in sorted(named.items(), key=lambda kv: -kv[1]):
+        if n >= 512:
+            print(f"    {n / 1024:6.1f} KB  {part}")
+    print(f"  CLAUDE.md chain  {sum(n for _, n in chain) // 1024} KB")
+    for f, n in chain:
+        print(f"    {n / 1024:6.1f} KB  {f}")
+    hooks = session_start_commands(cwd, cfg)
+    if hooks:
+        print("  SessionStart hooks, whose output comes on top (not run here):")
+        for cmd, where in hooks:
+            print(f"    {cmd}  ({where})")
+    if s.get("connectors", est.meta.get("connectors")) is not False:
+        print("  claude.ai connectors on the account are listed too; `connectors = false` in the roster or estate.toml "
+              "turns them off")
 
 
 def cmd_status(a) -> None:
@@ -5964,8 +6935,12 @@ td.n,th.n{{text-align:right}}
 def cmd_hook(a) -> None:
     """What a seat session's Claude Code hooks run. Installed by launch and run
     through --settings, so nothing edits an account's settings.json."""
-    if a.event not in ("precompact", "release-guard", "record-guard", "usage", "limited", "shift"):
-        die(f"no hook '{a.event}'")
+    if a.event not in ("precompact", "release-guard", "record-guard", "usage", "limited", "shift", "tool-shift",
+                       "asked", "asked-wait", "answered"):
+        # Not `die`: exit 2 from a hook blocks the tool, and a session launched by a newer binary
+        # than this one must not have every call refused for it.
+        print(f"curia: no hook '{a.event}'", file=sys.stderr)
+        sys.exit(1)
     try:
         payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
     except (json.JSONDecodeError, ValueError):
@@ -5978,7 +6953,8 @@ def cmd_hook(a) -> None:
     if a.event != "precompact":
         est = Estate(Path(est_dir))
         {"release-guard": hook_release_guard, "record-guard": hook_record_guard, "usage": hook_usage,
-         "limited": hook_limited, "shift": hook_shift}[a.event](est, seat, payload)
+         "limited": hook_limited, "shift": hook_shift, "tool-shift": hook_tool_shift, "asked": hook_asked,
+         "asked-wait": hook_asked_wait, "answered": hook_answered}[a.event](est, seat, payload)
         return
     if payload.get("trigger", "manual") != "manual":
         return  # auto-compaction: nothing to say
@@ -6008,11 +6984,14 @@ def hook_usage(est: Estate, seat: str, payload: dict) -> None:
     # (context_at), since a long context costs more every turn and hands off worse.
     ctx = payload.get("context_window") if isinstance(payload.get("context_window"), dict) else {}
     context = ctx.get("used_percentage") if isinstance(ctx.get("used_percentage"), (int, float)) else None
+    size = ctx.get("context_window_size") if isinstance(ctx.get("context_window_size"), (int, float)) else None
+    context_tokens = round(context / 100 * size) if context is not None and size else None
     write_json(usage_path(cfg), {"at": at, "account": acct, "seat": seat, "session_id": sid, **windows})
     if sid:
         write_json(cfg / "curia-usage" / f"{sid}.json",
                    {"at": at, "account": acct, "seat": seat, "cost_usd": cost.get("total_cost_usd"),
-                    "duration_ms": cost.get("total_duration_ms"), "context_pct": context, **windows})
+                    "duration_ms": cost.get("total_duration_ms"), "context_pct": context,
+                    "context_tokens": context_tokens, **windows})
     bits = [est.roster.get(seat, {}).get("title", seat), acct]
     for w, label in (("five_hour", "5h"), ("seven_day", "7d"), ("spend_limit", "spend")):
         d = windows.get(w, {})
@@ -6125,6 +7104,9 @@ def hook_limited(est: Estate, seat: str, payload: dict) -> None:
     log_session(sd, "limit", f"account={note['account']} until={note['until']} session={note['session_id']} ({why})")
 
 
+SHIFT_CHECK_SECONDS = 60   # how often PostToolUse really asks whether the shift is over; it runs on every tool call
+
+
 def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     """Stop: at the end of a turn, is the shift over? Past handoff_at on the
     account's fullest window, past shift_hours awake, past the deadline, or
@@ -6145,6 +7127,69 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     marker = sd / "SHIFT-OVER"
     if marker.exists():
         return
+    reasons = shift_reasons(est, seat, payload)
+    if not reasons:
+        return
+    sd.mkdir(parents=True, exist_ok=True)
+    marker.write_text(now().isoformat(timespec="seconds") + " " + "; ".join(reasons) + "\n")
+    log_session(sd, "shift", "; ".join(reasons))
+    print(shift_orders(reasons), file=sys.stderr)
+    sys.exit(2)
+
+
+def shift_orders(reasons: list[str]) -> str:
+    """What a seat past its shift is told, from either hook."""
+    if os.environ.get("CURIA_LOOP"):
+        after = ("The relaunch lands on an account with headroom and a fresh context, and the next session is "
+                 "you, reading your note; nothing is lost by stopping here.")
+    else:
+        after = ("This launch has no --loop, so nobody relaunches you after /handoff: put in your note, and "
+                 "tell the principal, what is in flight and what a relaunch would carry on. Jobs started with "
+                 "`curia dispatch`, `curia run` or `curia bg` are their own processes and finish their record "
+                 "without you.")
+    return ("Shift over: " + "; ".join(reasons) + ". Hand off now: finish or park what is in hand, then run "
+            "/handoff. " + after)
+
+
+def hook_tool_shift(est: Estate, seat: str, payload: dict) -> None:
+    """PostToolUse: the Stop hook's question, asked inside a turn. Stop fires only
+    when a turn ends, and one turn has run eight hours past every guard. Asked at
+    most once a minute, since this runs on every tool call. Told once by context on
+    the next model request, and again every shift_remind_minutes. SHIFT-TOLD is its
+    own marker: the Stop hook still has its one word when the turn does end."""
+    if os.environ.get("CURIA_HEADLESS"):
+        return
+    sd = est.seat_dir(seat)
+    if (sd / "RESTART").exists():
+        return   # handoff --done has run; there is nothing more to order
+    told, checked = sd / "SHIFT-TOLD", sd / "SHIFT-CHECKED"
+    t = time.time()
+
+    def say(text: str) -> None:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
+
+    if told.exists():
+        every = est.threshold("shift_remind_minutes") * 60
+        if every > 0 and t - told.stat().st_mtime >= every:
+            os.utime(told)
+            say(shift_orders(read(told).strip().split("; ")))
+        return
+    if checked.exists() and t - checked.stat().st_mtime < SHIFT_CHECK_SECONDS:
+        return
+    sd.mkdir(parents=True, exist_ok=True)
+    checked.touch()
+    reasons = shift_reasons(est, seat, payload)
+    if not reasons:
+        return
+    told.write_text("; ".join(reasons) + "\n")
+    log_session(sd, "shift", "mid-turn: " + "; ".join(reasons))
+    say(shift_orders(reasons))
+
+
+def shift_reasons(est: Estate, seat: str, payload: dict) -> list[str]:
+    """Why this session's shift is over, if it is: the account's fullest window, its
+    hours awake, how deep its context is, the night's deadline, the night's budget."""
+    sd = est.seat_dir(seat)
     cfg = Path(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")))
     acct = current_account(est) or cfg.name
     reasons = []
@@ -6163,8 +7208,12 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
     context_at = est.threshold("context_at")
     this = read_json(cfg / "curia-usage" / f"{payload.get('session_id') or '?'}.json") or {}
     context = this.get("context_pct")
+    tokens_at, tokens = est.threshold("context_tokens_at"), this.get("context_tokens")
     if context_at > 0 and isinstance(context, (int, float)) and context >= context_at:
         reasons.append(f"this session's context is {context:.0f}% full (context_at is {context_at:g}%)")
+    elif tokens_at > 0 and isinstance(tokens, (int, float)) and tokens >= tokens_at:
+        reasons.append(f"this session's context holds about {tokens / 1000:.0f}k tokens "
+                       f"(context_tokens_at is {tokens_at / 1000:g}k)")
     until = os.environ.get("CURIA_UNTIL")
     if until:
         until_dt = parse_iso(until)
@@ -6190,21 +7239,61 @@ def hook_shift(est: Estate, seat: str, payload: dict) -> None:
         if total >= budget * wrap_at_pct / 100:
             reasons.append(f"recorded spend ${total:.2f} of the night's ${budget:.2f} budget"
                            + (f", ${fleet:.2f} of it by your fleet" if fleet else ""))
-    if not reasons:
+    return reasons
+
+
+def hook_asked(est: Estate, seat: str, payload: dict) -> None:
+    """PreToolUse on AskUserQuestion: a seat is about to stop and wait on the
+    principal, and an unattended estate stops with it (87 minutes, one night, with
+    nobody told). Mark the question and leave a sleeper to look again after
+    ask_notify_minutes, so a question answered at the keyboard costs nobody a mail.
+    Refuses nothing. The sleeper is a process of its own: this hook must return."""
+    if os.environ.get("CURIA_HEADLESS"):
         return
+    sd = est.seat_dir(seat)
     sd.mkdir(parents=True, exist_ok=True)
-    marker.write_text(now().isoformat(timespec="seconds") + " " + "; ".join(reasons) + "\n")
-    log_session(sd, "shift", "; ".join(reasons))
-    if os.environ.get("CURIA_LOOP"):
-        after = ("The relaunch lands on an account with headroom and a fresh context, and the next session is "
-                 "you, reading your note; nothing is lost by stopping here.")
-    else:
-        after = ("This launch has no --loop, so nobody relaunches you after /handoff: put in your note, and "
-                 "tell the principal, what is in flight and what a relaunch would carry on. Jobs started with "
-                 "`curia dispatch` or `curia run` are their own processes and finish their record without you.")
-    print("Shift over: " + "; ".join(reasons) + ". Hand off now: finish or park what is in hand, then run "
-          "/handoff. " + after, file=sys.stderr)
-    sys.exit(2)
+    tid = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("tool_use_id") or "")) or stamp()
+    ask = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    questions = [str(q.get("question")) for q in ask.get("questions") or [] if isinstance(q, dict) and q.get("question")]
+    marker = sd / f"ASKING-{tid}"
+    write_json(marker, {"at": now().isoformat(timespec="seconds"), "questions": questions})
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "hook", "asked-wait"],
+                         env=dict(os.environ, CURIA_ASKING=str(marker)), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        print(f"curia: could not watch the question: {e}", file=sys.stderr)
+
+
+def hook_asked_wait(est: Estate, seat: str, payload: dict) -> None:
+    """The sleeper hook_asked leaves: after ask_notify_minutes, a question still
+    unanswered goes to the principal through the estate's notify."""
+    marker = Path(os.environ.get("CURIA_ASKING") or "/nonexistent")
+    time.sleep(est.threshold("ask_notify_minutes") * 60)
+    note = read_json(marker) if marker.exists() else None
+    if note is None:
+        return
+    name, s = est.seat(seat)
+    title = s.get("title", name)
+    log_session(est.seat_dir(name), "asked", f"unanswered since {note.get('at', '?')}; the principal told")
+    notify(est, f"NEEDS YOU: {title} is waiting on your answer",
+           f"{title} asked at {note.get('at', '?')} and is stopped until you answer:\n\n"
+           + "\n".join(f"- {q}" for q in note.get("questions") or ["(the question did not say)"]))
+
+
+def hook_answered(est: Estate, seat: str, payload: dict) -> None:
+    """PostToolUse and PostToolUseFailure on AskUserQuestion: the question is over, so
+    the sleeper has nothing to say. How long it stood goes in the record if that was long."""
+    tid = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("tool_use_id") or ""))
+    sd = est.seat_dir(seat)
+    marker = sd / f"ASKING-{tid}"
+    if not tid or not marker.exists():
+        return
+    note = read_json(marker) or {}
+    marker.unlink(missing_ok=True)
+    at = parse_iso(str(note.get("at") or ""))
+    if at and (now() - at).total_seconds() >= est.threshold("ask_notify_minutes") * 60:
+        log_session(sd, "answered", f"after {(now() - at).total_seconds() / 60:.0f} minutes")
 
 
 def fence_log(est: Estate, seat: str, fence: str, what: str) -> None:
@@ -6355,6 +7444,12 @@ Waking seats
 Watching (crons watch, models act; gates neither)
   lictor                    read-only nudge report across every repo, and over the law: rulings and fences (--fence-days, --fence-busy; with jev, CUSTOM and --custom-handoffs)
   censor                    check integration branches; wake the Censor where red
+  watch                     the record as a stream, for a seat to wait on without spending (--once, --since, --event)
+  bg                        a command detached from this session: a log, an EXIT line, a record `watch` can wait on
+  stop <seat>               stop a seat's headless run or background job, on the record's proof it is the seat's
+  tell "..."                tell the principal now, through the estate's notify; capped per hour
+  waiting                   who a repo's board waits on, by person, with what each answer would unblock
+  weight <seat>             what a seat carries at waking: prime by part, CLAUDE.md chain, SessionStart hooks
   portcullis                land the seats' PRs that are reviewed and green; close their beads (--dry-run)
   reap                      close the record of dead sessions; remove worktrees that landed or went stale (--dry-run)
 
@@ -6544,18 +7639,106 @@ done; --detach returns at once with the pid and the log path, and
 assignments.log says `returned` and `reviewed` when they are. The worktree
 is prepared, and a refusal given, before anything is forked.
 
---review <seat> then wakes that seat headless in the same worktree with
-prompts/review.md (or --review-prompt): the third step of design,
-implement, review. The reviewer fixes what it is sure of on the branch and
-marks the PR reviewed, or requests changes and reopens the bead; it never
-files a new bead, so a board the loop works converges. The Portcullis lands
-what is reviewed and green.
+--review <seat> then wakes that seat headless with prompts/review.md (or
+--review-prompt): the third step of design, implement, review. It reviews in
+a home of its own, <worktrees>/<reviewer>/<repo>-review (-2, -3 for reviews
+running at once), on a detached HEAD at the branch's tip; {worktree} is that
+home and {worker_home} the worker's. It pushes fixes with `git push origin
+HEAD:{branch}`. The worker's home is free from the moment it returns, so the
+worker can take its next job while the review runs; `assignments.log` says
+`reviewing` and then `reviewed`. The reviewer fixes what it is sure of on the
+branch and marks the PR reviewed, or requests changes and reopens the bead; it
+never files a new bead, so a board the loop works converges. The Portcullis
+lands what is reviewed and green. Reviewer homes are kept for their
+provisioning; `reap` leaves them.
 The exit status is non-zero when the worker or the reviewer failed.
+
+Refused before anything is forked: another seat with a live session in the
+worker's home (--share overrides), and a machine past its floor
+(estate.toml floor_disk_gb, default 5, and floor_swap_gb, default off), which
+also tells the principal, hourly at most. --ignore-floor is for the job that
+frees room. `run` and `bg` refuse the same way.
 
 Dispatch never claims or closes a bead, never merges, never removes a
 worktree; the brief tells the worker to claim, `portcullis` closes on
 landing, `reap` removes when landed. Only fleet seats are dispatched; crew
 and offices are launched or run.""",
+
+    "watch": """\
+The estate's record as a stream: each line of the seats' assignments.log
+(dispatch, returned, reviewing, reviewed, run, done, bg, bg-done, reap), and
+with --sessions their sessions.log, as `<event> <time> seat=<seat> <detail>`,
+as it is written. Spends nothing while it waits. A seat runs it under its
+Monitor tool, each line waking it, and ends its turn meanwhile, so the hooks
+that speak at the end of a turn can speak; sleeping in a tool call does neither.
+
+--seat, --event, --bead and --match narrow it. From now by default; --since
+starts earlier and is inclusive, so a session resuming after a handoff, passing
+the last time it saw, misses nothing and may see that line again. --once exits
+after the first look that finds something; --timeout gives up with exit status 3.
+It stops when whatever started it has gone.
+
+It reads and never writes. It says what the record says, so it cannot see a CI
+run; `launch --everything` waits on those itself at the end of a night.""",
+
+    "bg": """\
+Run a command detached from the session that asked for it, in a process session
+of its own, with its output in seats/<seat>/runs/<stamp>-bg-<label>.log and a
+final EXIT=<status> line there. `bg` and `bg-done` go in the seat's
+assignments.log, so `curia watch --event bg-done` is how to wait on it. It
+outlives a handoff, a session end and the sweep that ends a session's leftovers;
+that is what it is for, and the next waking's prime names a job still running.
+
+After --, the command: several words run as given; one string goes through sh.
+It is cut off with everything it started after --timeout, by default estate.toml
+bg_hours (6). --list says what the seat has running. `curia stop <seat> --bg
+<label>` ends one. Refused past the machine's floor (--ignore-floor is for the
+job that frees room). It holds no gate slot and knows no gate: a repo's own
+scripts still decide what may run at once.""",
+
+    "stop": """\
+Stop a seat's headless run or background job. It signals the job whose pid is on
+the record: the job ends the process group it started and writes its own end line,
+and a chained review does not start after a stopped worker. Then whatever still
+carries the run's id (CURIA_RUN) is stopped too, wherever it went, as far as `ps`
+can see it: macOS hides the environment of its own binaries, so a bare shell that
+left the group is not found. `stopped` goes in sessions.log (`bg-stopped` in
+assignments.log), with who and, given --why, why; it says whether the job went.
+
+A seat stops its own work; an office with a fleet, any job on the estate; the
+principal, anything. Several runs need --session or --all. A session awake with a
+person is no job and is left to them; a looped launcher is ended where it runs. A
+run started before this version has a launcher that would die without ending it,
+so nothing is done, and it says so.""",
+
+    "tell": """\
+Tell the principal now, through the estate's `notify` command, with the seat's
+title on the subject. Mail waits for a waking; this does not, so it is logged
+and capped at estate.toml tell_per_hour (6) per seat. It refuses, and says
+nobody was told, when the estate names no notify, the cap is reached, or the
+command fails. It carries a sentence, not a decision: nothing waits on a reply,
+and the answer comes however the principal chooses.
+
+A question asked with AskUserQuestion is told for you: unanswered after
+ask_notify_minutes (5), the principal hears it, so a question answered at the
+keyboard costs nobody a mail.""",
+
+    "waiting": """\
+Who a repo's board waits on: the beads `launch --everything` leaves alone, grouped
+by person (the label in estate.toml human_labels, with -question dropped), then
+those deferred and those blocked only by what waits on someone. Each bead shows how
+many open beads it holds up, directly or not, and the people come largest first.
+--by reads the board as `launch --by` does. Read from the same export the launcher
+reads. It writes nothing and asks nobody: this is the list a handoff need not retype.""",
+
+    "weight": """\
+What a seat carries before its first turn, in bytes: the prime part by part, each
+memory file Claude Code loads from where the seat would wake (the account's, then
+each directory down to it), and the SessionStart hooks that will run. Their output
+comes on top: they are named, not run, since a hook may do anything. Neither is
+the listing Claude Code adds itself (skills, deferred tools, connectors); estate.toml
+`[skills]`, and `connectors = false` for the estate or a seat, trim those. Writes
+nothing, and asks nobody.""",
 
     "portcullis": """\
 The land gate. For each github repo with an integration branch, list the
@@ -6603,7 +7786,13 @@ reap_stale_days in estate.toml, one that is clean, unlanded, has no open
 PR per gh and was not touched that long is removed too, its branch kept so
 nothing is lost. A worktree on the integration or release branch is
 standing and stays. Anything unfinished, unlanded, dirty or in use is left
-where it is, with a line saying why. --dry-run says what would go.
+where it is, with a line saying why. A LIMITED marker on a seat with no
+session awake is cleared. Processes whose run the record says is over (they
+carry its id in CURIA_RUN, and its session has ended or its launcher gone) are
+stopped; one with no run id, another estate's, a live run's or a run this estate
+never recorded is left alone. Reviewer homes (<worktrees>/<seat>/<repo>-review)
+are standing: they are kept for what they have provisioned. --dry-run says what
+would go.
 
 A seat with `reap_after = true` in the roster (the one that merges,
 typically) reaps at the end of every session `launch` gives it, and its
@@ -6933,8 +8122,15 @@ to export and push before handing off). The loop ends when nothing remains
 that is not waiting on a human, or when two wakings in a row leave the
 board as it was - no open bead changed status or was touched, nothing
 closed; a bead taken from ready to in progress is movement - so a stuck
-seat does not spin all night; the principal is told either way. --say is
-appended to the orders.
+seat does not spin all night. An epic with nothing workable beneath it counts
+for nothing: it is a folder, not work. Either way the loop's last act is to
+wait, spending nothing, on the CI runs that started on the repo's integration
+branch since the launcher began (settle_minutes in estate.toml, default 90;
+0 skips it; a repo with no gate or forge has nothing to wait on; one wait for all
+the boards, and never past --until), and only then tell the principal, with how
+they stand. A red run marks the notice NEEDS YOU and earns one more waking, with
+that run as its orders, if the night has room and nothing else has woken the seat
+meanwhile; the launcher stops after it. --say is appended to the orders.
 
 --by, with --everything, narrows the night to the beads one person filed.
 A bead is theirs when its created_by (the name it was filed under) or its
@@ -6950,10 +8146,10 @@ movement. Every --by is read against the boards given before the first
 waking: one that matches no bead stops the launch and lists who has filed
 there, since a misspelt name would otherwise read as a clear board. The
 launch prints what each board comes to and who was left out; --print-cmd
-does the same without launching. It will NOT look at the assignee (a bead
-this person filed and someone else has claimed is still in scope), follow
-a dependency out of scope, or fence anything: the orders are what keep the
-seat off other people's beads, and `bd` still shows it the whole board.
+does the same without launching. A bead assigned to someone neither named by
+--by nor a seat has been handed to them, and is theirs whoever filed it. It will
+NOT follow a dependency out of scope, or fence anything: the orders are what keep
+the seat off other people's beads, and `bd` still shows it the whole board.
 
 When a session ends on its handoff, the launcher prints the note back
 into the terminal - claude clears the screen on exit, and a launch that
@@ -7093,9 +8289,15 @@ log when the run ends, so a foreground call reads as before, and Ctrl-C
 stops only the waiting; --detach prints the pid and the log path and
 returns at once. Either way the record (sessions.log, brain/<seat>/, and
 assignments.log when a bead is named) is the run's own and is complete
-whether or not the caller is still there. A run cut at --timeout is ended
-with its whole process group, so a server the seat started does not go on
-holding its port after the seat is gone.
+whether or not the caller is still there. A run is ended with its whole
+process group, cut at --timeout or not, and every process still carrying its
+run id (CURIA_RUN) is stopped when it ends, as far as `ps` can see one (macOS hides
+the environment of its own binaries, so a bare shell that left the group is not
+found; python and node are; shared daemons are spared), so a server or a probe the
+seat started does not go on holding a port or a core after the seat is gone. `curia
+bg` is the way to outlive it. Past the machine's floor (floor_disk_gb, default 5;
+floor_swap_gb, default off) a run is refused and the principal told;
+--ignore-floor is for the job that frees room.
 
 Memory: there is no /handoff in a headless run, so the prompt ends with
 orders to write a short journal entry to seats/<seat>/journal/<stamp>-<repo>.md
@@ -7557,6 +8759,34 @@ examples:
   curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   ...then a review
   curia dispatch <fleet> --bead <id> --repo <repo> --detach   back at once; assignments.log says when it returned
   curia dispatch <fleet> --bead <id> --print-cmd              where it would go; run nothing""",
+    "watch": """\
+examples:
+  curia watch --event returned,reviewed       every job's return, as it happens (for Monitor)
+  curia watch --bead <id> --event reviewed --once   wait for one verdict, then exit
+  curia watch --event bg-done --since 2h      what finished while you were away
+  curia watch --sessions --seat <seat>        one seat's whole record""",
+    "bg": """\
+examples:
+  curia bg --label gate --cwd <dir> -- "just ci"   a gate that outlives this session
+  curia bg --seat <seat> --list               what the seat still has running
+  curia bg --ignore-floor -- sh <script>      the job that frees the room""",
+    "stop": """\
+examples:
+  curia stop <seat> --why "superseded"        a seat's one headless run
+  curia stop <seat> --session <id>            one of several
+  curia stop <seat> --bg <label>              a background job""",
+    "tell": """\
+examples:
+  curia tell "the disk is nearly full; two gates stopped"
+  curia tell "stack ready to land" --body "..." --report <file>""",
+    "waiting": """\
+examples:
+  curia waiting <repo>                        by person, biggest unblock first
+  curia waiting <repo> --by <name>            as a --by night reads it""",
+    "weight": """\
+examples:
+  curia weight <seat>                         what it carries, from here
+  curia weight <fleet> --repo <repo>          as it would wake in its home there""",
     "portcullis": """\
 examples:
   curia portcullis --dry-run           what would land, and why the rest would not
@@ -7867,6 +9097,8 @@ def main() -> None:
                    help="return at once with the pid and the log path; the run (its own process either way) "
                         "finishes its record without you. Default: wait and print the answer when it ends")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true", help="show account, model, cwd, prompt size and skill listing without running")
+    p.add_argument("--ignore-floor", dest="ignore_floor", action="store_true",
+                   help="start even past the machine's floor: for the job that frees room")
     p.set_defaults(fn=cmd_run)
 
     p = parser("dispatch", "give a fleet worker a worktree of its own and a job there; --review adds a reviewer")
@@ -7874,7 +9106,7 @@ def main() -> None:
     p.add_argument("--bead", required=True, help="the bead to implement; the branch is <seat>/<bead>")
     p.add_argument("--repo", help="the repo to work in (default: the repo you are in)")
     p.add_argument("--prompt", help="the worker's brief: a file in the estate's prompts/, or a path (default dispatch.md)")
-    p.add_argument("--review", help="after the worker returns, wake this seat headless in the worktree to review")
+    p.add_argument("--review", help="after the worker returns, wake this seat headless in a home of its own to review")
     p.add_argument("--review-prompt", dest="review_prompt", help="the reviewer's brief (default review.md)")
     p.add_argument("--timeout", type=int, default=3600,
                    help="seconds before a waking is cut off, with everything it started (default 3600)")
@@ -7886,7 +9118,60 @@ def main() -> None:
                         "finishes its record without you. Default: wait and print the answers when it ends")
     p.add_argument("--print-cmd", dest="print_cmd", action="store_true",
                    help="show the worktree, branch, account and brief without touching git or running")
+    p.add_argument("--share", action="store_true",
+                   help="dispatch even though another seat has a live session in the worker's home")
+    p.add_argument("--ignore-floor", dest="ignore_floor", action="store_true",
+                   help="start even past the machine's floor: for the job that frees room")
     p.set_defaults(fn=cmd_dispatch)
+
+    p = parser("watch", "the record as a stream, one line per event, spending nothing while it waits")
+    p.add_argument("--seat", action="append", help="only this seat (repeatable; default: every seat)")
+    p.add_argument("--event", action="append", help="only these events, comma separated: dispatch, returned, reviewing, "
+                   "reviewed, run, done, bg, bg-done, reap, and with --sessions start, end, handoff, shift, ...")
+    p.add_argument("--bead", help="only this bead")
+    p.add_argument("--match", help="only lines this regular expression finds")
+    p.add_argument("--since", help="start back here: a date, an ISO time, or a span like 2h (inclusive). Default: from now")
+    p.add_argument("--sessions", action="store_true", help="also sessions.log, not only assignments.log")
+    p.add_argument("--once", action="store_true", help="exit after the first look that finds something")
+    p.add_argument("--timeout", type=int, help="give up after this many seconds, with exit status 3")
+    p.set_defaults(fn=cmd_watch)
+
+    p = parser("bg", "a command detached from this session: a log, an EXIT line, and a record `watch` can wait on")
+    p.add_argument("--seat", help="the seat whose job it is (default: CURIA_SEAT)")
+    p.add_argument("--label", help="its name in the record (default: the program's)")
+    p.add_argument("--cwd", help="where it runs (default: here)")
+    p.add_argument("--timeout", type=int, help="seconds before it is cut off with everything it started "
+                   "(default: estate.toml bg_hours, 6 hours)")
+    p.add_argument("--wait", action="store_true", help="stay and print the log when it ends. Default: back at once")
+    p.add_argument("--list", action="store_true", help="the seat's jobs still running; run nothing")
+    p.add_argument("--ignore-floor", dest="ignore_floor", action="store_true",
+                   help="start even past the machine's floor: for the job that frees room")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="after --: the command, or one shell string")
+    p.set_defaults(fn=cmd_bg)
+
+    p = parser("stop", "stop a seat's headless run or background job, on the record's proof that it is the seat's")
+    p.add_argument("seat", help="the seat whose work to stop")
+    p.add_argument("--session", help="which run, by session id or its start; needed when there are several")
+    p.add_argument("--all", action="store_true", help="every headless run of the seat")
+    p.add_argument("--bg", help="a background job instead, by label or run id")
+    p.add_argument("--why", help="the reason, for the record")
+    p.set_defaults(fn=cmd_stop)
+
+    p = parser("tell", "tell the principal now, through the estate's notify; capped per hour")
+    p.add_argument("subject", help="one line")
+    p.add_argument("--body", help="more, if the subject is not enough")
+    p.add_argument("--report", help="a file the estate's notify may attach or link")
+    p.set_defaults(fn=cmd_tell)
+
+    p = parser("waiting", "who a repo's board waits on, by person, with what each answer would unblock")
+    p.add_argument("repo", nargs="?", help="the repo (default: the repo you are in)")
+    p.add_argument("--by", action="append", help="only beads this name or email filed, as `launch --by` reads it")
+    p.set_defaults(fn=cmd_waiting)
+
+    p = parser("weight", "what a seat carries at waking: prime by part, CLAUDE.md chain, SessionStart hooks")
+    p.add_argument("seat", help="the seat to weigh")
+    p.add_argument("--repo", help="the repo it would wake in (default: the repo you are in, else the estate root)")
+    p.set_defaults(fn=cmd_weight)
 
     p = parser("handoff", "show a seat's handoff; --begin/--done belong to the /handoff skill")
     p.add_argument("seat", help="the seat whose handoff to show"); g = p.add_mutually_exclusive_group()

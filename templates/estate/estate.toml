@@ -94,6 +94,25 @@ context_at = 60
 # written down; past a point no work is legal. The Lictor says which are idle
 # and which are busy (brain/fences.log); the principal decides what stays.
 # fences_max = 20
+# What a waking lists: claude.ai connectors on the account cost context at every
+# waking; `connectors = false` turns them off (plugins stay), here for every seat or
+# in the roster for one: the fleet rarely calls them, a person's crew may well.
+# connectors = false
+# What the auto-mode classifier is told, after the seat's identity, as prose: the
+# estate's trusted repos, buckets and services. Context only; nothing here widens
+# what is refused. Say what is yours, not what to allow.
+# auto_mode_environment = ["Source control: <forge>/<org> and all repos under it"]
+# What the prime says that classifier refuses; this replaces the mechanism's list.
+# refused_classes = ["reading production systems or their secrets"]
+# A long context costs more every turn: past this many tokens a session is told to
+# hand off, however large its window. 0 turns it off.
+# context_tokens_at = 400000
+# `dispatch`, `run` and `bg` refuse past these (0 turns one off), and tell the principal.
+# floor_disk_gb = 5
+# floor_swap_gb = 0
+# How long a --everything launcher waits, spending nothing, on the integration run of
+# what it landed, before its final notice. 0 turns it off.
+# settle_minutes = 90
 # Labels that say a bead waits on a person. `launch --everything` leaves those
 # beads alone and stops when nothing else remains.
 human_labels = ["needs-principal", "needs-human", "blocked-by-human"]

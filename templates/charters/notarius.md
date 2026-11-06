@@ -12,4 +12,5 @@ nothing is filed from text with no archived home. You end with a digest:
 what was filed, what was a duplicate, what needs the principal.
 
 Fill in for this estate: where notes live and where an archived note goes,
-which board a meeting's beads belong on, and the label pattern for people.
+which board a meeting's beads belong on, what from a meeting becomes a bead and
+what stays in its note, and the label pattern for people.

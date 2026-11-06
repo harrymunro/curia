@@ -20,7 +20,10 @@ The denylist is read at test time from the estates registered in
 is forbidden to contain. If a prompt string needs to talk about an estate's
 notes, its vault, or its people, say "per your charter" and let the estate's
 charter carry the specifics. That test failing is the fence working; do not
-weaken it to get green.
+weaken it to get green. A repo an estate registers that IS the mechanism gives
+no word (it is this repo's own name), and an estate registered but absent from
+the machine is a warning in the test summary, because its words went unscreened.
+Where `python3` has no pytest: `uv run --no-project --with pytest python -m pytest -q tests`.
 
 ## Layout
 
@@ -101,8 +104,11 @@ weaken it to get green.
   `rotate_at` on its fullest window as the seat's status line last read it.
   A running session cannot change account; that is a fact about the harness,
   not a gap to paper over. So the hooks make the session END well: the Stop
-  hook says "hand off now" past `handoff_at`, `shift_hours` or `context_at`
-  (the status line's reading of the session's context window), the StopFailure
+  hook says "hand off now" past `handoff_at`, `shift_hours`, `context_at` or
+  `context_tokens_at` (the status line's reading of the session's context
+  window). Stop fires only when a turn ends and one turn can run for hours, so
+  `PostToolUse` asks the same question inside the turn, at most once a minute,
+  and repeats itself every `shift_remind_minutes`. It tells; it stops nothing. The StopFailure
   hook marks the account when a turn dies on the limit and leaves LIMITED for
   the launcher, which ends the session and relaunches. A headless run is a
   launch, so it marks its own limit and retries down the chain; a `--loop`
@@ -129,7 +135,10 @@ weaken it to get green.
   account names its dir, and logs in under that exact name.
 - How the principal is told is the estate's to say: `notify` in estate.toml is
   a command, and the mechanism only ever calls it with a subject, a body and a
-  report path. Nothing here knows a channel.
+  report path. Nothing here knows a channel. `tell` is the seat's own way to
+  that command, logged and capped; a question to the principal goes there by
+  itself once it has stood `ask_notify_minutes`, so one answered at the keyboard
+  costs nobody a mail.
 - Judgment selects and reports; it never writes, lands or ends anything.
   `jev()` puts typed questions (noul, choice, score) to a small decision
   model that generates no text. It is off until estate.toml names `jev_key`
@@ -171,7 +180,12 @@ weaken it to get green.
   of them needs judgment; do not add one that does. That is the seat's, in its
   handoff. Each waking's reading of the board is a `board` line in
   sessions.log and each handoff goes to the principal through `notify`, with
-  the board's movement and the handoff's own line for them; `progress` is the
+  the board's movement and the handoff's own line for them. An epic with nothing
+  workable beneath it counts for nothing: it is a folder, not work. A loop that
+  stops on a clear or unmoved board last waits, spending nothing, on the
+  integration run of what it landed (`settle_minutes`), puts how that stands in
+  its final notice, and spends one more waking only if it is red and the night
+  has room; `progress` is the
   read-only view over that record and writes nothing but the page `--html`
   asks for. The default review brief keeps the board convergent for the same
   reason: a reviewer fixes on the branch or hands the bead back, and never
@@ -179,7 +193,9 @@ weaken it to get green.
   working its own reviews, not the backlog. `--by` narrows the loop to the
   beads a person filed, by exact name or email from the bead's own record,
   never by judgment; those beads are still sorted against the whole board,
-  and the orders, not a fence, keep the seat off the rest.
+  and the orders, not a fence, keep the seat off the rest. A bead assigned to
+  someone neither named in `--by` nor a seat has been handed to them: it is
+  theirs, whoever filed it.
 - Mail is a file the reader archives. `seats/<seat>/mail.md` is read into the
   prime at every waking until the seat runs `curia mail <seat> --archive`;
   nothing archives it silently, and a seat mails a seat, never the outside.
@@ -187,6 +203,20 @@ weaken it to get green.
   reap only ever removes a worktree whose branch has landed and which holds
   nothing uncommitted. Reap closes a session record only when the launcher
   pid on the start line is provably gone; a live pid is left alone.
+  A reviewer works in a home of its own at the branch's tip, never in the
+  worker's: the worker is free when it returns, and no dispatch checks a branch
+  out under a running gate.
+- A session leaves nothing running. Every session's descendants carry its id in
+  `CURIA_RUN`, so when it ends what it left is stopped, whatever process group
+  it put itself in, and `reap` and `stop` act only on what the record proves is
+  a finished run's or the named seat's. `bg` is the one way to outlive a session.
+  A process with no run id, another estate's, or a shared daemon (`SWEEP_SPARES`,
+  `sweep_spares`) is never touched. `ps` is not the whole of it: macOS hides the
+  environment of its own binaries, so `stop` signals the job on the record, which
+  ends its own process group; the run id is for what left the group.
+- The machine has a floor. `dispatch`, `run` and `bg` refuse past
+  `floor_disk_gb` or `floor_swap_gb` and tell the principal; nothing else on an
+  estate owns the machine. Repos' own gate slots still decide what runs at once.
 - Fences are the estate's law with the mechanism as transport. `hooks.json`
   rides into every seat session through `--settings`; the mechanism ships
   `hook release-guard` as the worked example and nothing in it names a
@@ -202,7 +232,11 @@ weaken it to get green.
 - Authority is in the prime. `build_prime` ends with what the seat may do
   without asking, what is refused, the fences by name and the rulings in
   force, so a seat looks its authority up rather than probes for it. Keep
-  that section factual: names and statuses, not exhortation.
+  that section factual: names and statuses, not exhortation. `seat_settings`
+  tells the auto-mode classifier which seat this is and what is its own, as
+  `environment` prose; it never writes an allow rule, because widening what a
+  seat may do is the principal's decision, in the estate. What a waking carries
+  is measured by `weight`: a prime's standing text is spent at every waking.
 - A secondment is marked, not barred. A headless waking on a model that is
   not the roster's for it (fallback or `--model`) is told so in its prime
   and told to open its journal entry with `seconded: <model>`; the next
@@ -246,7 +280,8 @@ weaken it to get green.
   deferred and taken up as needed; `specs/2026-09-04-harness-seam.html`
   maps it. Until then, do not deepen the coupling: keep Claude-specific
   reaches inside `seat_settings`, `invoke_claude`, `headless_result`,
-  `ensure_skills` and `resolve_account`, not spread through commands.
+  `ensure_skills`, `resolve_account` and `claude_md_chain` with
+  `session_start_commands`, not spread through commands.
   Where a commitment above names a Claude Code mechanism (`--settings`, the
   status line, StopFailure), the principle is what binds and the mechanism
   is today's way of keeping it; another harness keeps it its own way or

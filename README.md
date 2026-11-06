@@ -146,6 +146,12 @@ curia laurel <seat> "a user said the new page finally makes sense"
 curia mail <seat> "the brief is in the bead; start there"   # read at the seat's next waking; --all broadcasts
 curia dispatch <fleet> --bead <id> --repo <repo> --review <seat>   # a worker gets a worktree and a job; a reviewer judges it
 curia dispatch <fleet> --bead <id> --repo <repo> --detach   # ...back at once; the job is its own process either way and outlives your shell
+curia watch --event returned,reviewed   # the record as a stream, for a seat's Monitor; spends nothing while it waits
+curia bg --label gate -- "just ci"   # a command that outlives this session: a log, an EXIT line, a record to watch
+curia stop <seat> --why "superseded"   # stop a seat's headless run, on the record's proof that it is the seat's
+curia tell "the disk is nearly full"   # tell the principal now, through the estate's notify; capped per hour
+curia waiting <repo>             # who the board waits on, by person, with what each answer would unblock
+curia weight <seat>              # what a waking carries before its first turn
 curia portcullis                 # land the seats' reviewed, green PRs and close their beads (a cron runs this)
 curia reap                       # close the record of dead sessions; remove worktrees that landed (or, --stale, went stale)
 curia rulings                    # the brain's rulings, with status and what enforces each

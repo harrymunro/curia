@@ -20,7 +20,10 @@ that promotes to a release branch, if this estate promotes at all.
 2. Dispatch the fleet as seats: `curia dispatch <worker> --bead <id> --repo
    <repo> --review <crew seat>`, one home and one job per worker. Claim the
    bead before dispatch. The worker's report is its journal; its record is
-   `seats/<worker>/assignments.log`.
+   `seats/<worker>/assignments.log`. A worker is free once it returns: the
+   reviewer has a home of its own, so dispatch the worker's next job at once.
+   Wait on `curia watch` under your Monitor tool and end your turn; run a gate
+   that must outlive you with `curia bg`.
 3. The Portcullis lands what is reviewed and green and closes the bead. You
    never idle-wait on a PR; you dispatch the next job.
 4. End the night with a handoff: what landed, what is open, what needs the

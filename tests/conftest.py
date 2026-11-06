@@ -113,6 +113,8 @@ def estate(curia, cli, tmp_path, monkeypatch):
     monkeypatch.setattr(curia, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(curia, "ESTATES_FILE", tmp_path / "config" / "estates.toml")
     monkeypatch.setattr(curia, "DETACH_RUNS", False)   # fakes record in-process; the fork has its own test
+    monkeypatch.setattr(curia, "run_processes", lambda: [])   # nothing here sweeps or stops a real process
+    monkeypatch.setattr(curia, "machine_reading", lambda path: {"disk_free_gb": 500.0, "swap_used_gb": 0.0})
     ws = tmp_path / "ws"
     rc, out, err = cli("init", str(ws), "--name", "Scratch", "--principal", "Nobody Inparticular", "--shape", "factory")
     assert rc == 0, err
@@ -134,5 +136,6 @@ def estate(curia, cli, tmp_path, monkeypatch):
     meta = (cd / "estate.toml").read_text()
     meta = meta.replace('created = "YYYY-MM-DD"', 'created = "2026-01-01"')
     meta = meta.replace("choose one per estate so a seat name is never ambiguous", "scratch")
+    meta = "settle_minutes = 0   # the last act reaches no forge unless a test asks\n" + meta
     (cd / "estate.toml").write_text(meta)
     return curia.Estate(cd)
